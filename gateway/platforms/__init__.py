@@ -9,6 +9,9 @@ Each adapter handles:
 """
 
 from .base import BasePlatformAdapter, MessageEvent, SendResult
+from .qqbot import QQAdapter
+from .yuanbao import YuanbaoAdapter
+from .skytower import SkyTowerAdapter
 
 # QQAdapter and YuanbaoAdapter were previously imported eagerly here, but
 # nothing in the codebase consumes ``from gateway.platforms import
@@ -28,6 +31,7 @@ __all__ = [
     "SendResult",
     "QQAdapter",
     "YuanbaoAdapter",
+    "SkyTowerAdapter",
 ]
 
 

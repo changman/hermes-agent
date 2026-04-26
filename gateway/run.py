@@ -3994,6 +3994,7 @@ class GatewayRunner:
             "QQ_ALLOWED_USERS",
             "YUANBAO_ALLOWED_USERS",
             "GATEWAY_ALLOWED_USERS",
+            "SKYTOWER_ALLOWED_USERS"
         )
         _builtin_allow_all_vars = (
             "TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
@@ -4008,6 +4009,7 @@ class GatewayRunner:
             "BLUEBUBBLES_ALLOW_ALL_USERS",
             "QQ_ALLOW_ALL_USERS",
             "YUANBAO_ALLOW_ALL_USERS",
+            "SKYTOWER_ALLOW_ALL_USERS",
         )
         # Also pick up plugin-registered platforms — each entry can declare
         # its own allowed_users_env / allow_all_env, so the warning stays
@@ -6433,6 +6435,17 @@ class GatewayRunner:
                 logger.warning("Yuanbao: websockets not installed. Run: pip install websockets")
                 return None
             return YuanbaoAdapter(config)
+        elif platform == Platform.SKYTOWER:
+            from gateway.platforms.skytower import SkyTowerAdapter, check_skytower_requirements
+            if not check_skytower_requirements():
+                logger.error(
+                    "Skytower: python-socketio not installed. "
+                    "Run: pip install 'python-socketio[asyncio_client]'"
+                )
+                return None
+            return SkyTowerAdapter(config)
+
+        return None
 
         return None
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -6503,6 +6516,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+            Platform.SKYTOWER: "SKYTOWER_ALLOWED_USERS",
         }
         platform_group_user_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -6529,6 +6543,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
+            Platform.SKYTOWER: "SKYTOWER_ALLOW_ALL_USERS",
         }
         # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
         platform_allow_bots_map = {
