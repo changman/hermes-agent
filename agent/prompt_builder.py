@@ -513,6 +513,13 @@ PLATFORM_HINTS = {
         "image and is the WRONG path. Bare Unicode emoji in text is also not a substitute "
         "— when a sticker is the right response, use yb_send_sticker."
     ),
+    "skytower": (
+        "You are chatting via Skytower, a web-based relay platform. "
+        "Full Markdown rendering is supported — headings, bold, italic, code blocks, "
+        "tables, and links all display correctly. "
+        "Responses are streamed in real time as you generate them. "
+        "Keep replies conversational and well-structured."
+    ),
 }
 
 # ---------------------------------------------------------------------------

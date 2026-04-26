@@ -108,6 +108,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    SKYTOWER = "skytower"
     @classmethod
     def _missing_(cls, value):
         """Accept unknown platform names only for known plugin adapters.
@@ -383,6 +384,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
         (cfg.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
         and (cfg.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
     ),
+    Platform.SKYTOWER: lambda cfg: bool(
+        (cfg.extra.get("token") or os.getenv("SKYTOWER_TOKEN"))
+    )
 }
 
 
@@ -1566,6 +1570,17 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         yuanbao_group_allow_from = os.getenv("YUANBAO_GROUP_ALLOW_FROM")
         if yuanbao_group_allow_from:
             extra["group_allow_from"] = yuanbao_group_allow_from
+    # Skytower Relay
+    skytower_token = os.getenv("SKYTOWER_TOKEN")
+    skytower_url = os.getenv("SKYTOWER_URL")
+    if skytower_token and skytower_url:
+        if Platform.SKYTOWER not in config.platforms:
+            config.platforms[Platform.SKYTOWER] = PlatformConfig()
+        config.platforms[Platform.SKYTOWER].enabled = True
+        config.platforms[Platform.SKYTOWER].extra.update({
+            "token": skytower_token,
+            "url": skytower_url,
+        })
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")
