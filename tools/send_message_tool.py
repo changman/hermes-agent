@@ -651,6 +651,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_qqbot(pconfig, chat_id, chunk)
         elif platform == Platform.YUANBAO:
             result = await _send_yuanbao(chat_id, chunk)
+        elif platform == Platform.SKYTOWER:
+            result = await _send_skytower(pconfig.extra, chat_id, chunk)
         else:
             # Plugin platform — route through the gateway's live adapter
             # if available, otherwise report the error.
@@ -1765,6 +1767,57 @@ async def _send_yuanbao(chat_id, message, media_files=None):
         return await send_yuanbao_direct(adapter, chat_id, message, media_files=media_files)
     except Exception as e:
         return _error(f"Yuanbao send failed: {e}")
+async def _send_skytower(extra: dict, chat_id: str, message: str) -> dict:
+    """Send a message to a Skytower conversation via Relay REST API.
+
+    chat_id 형식: skytower:{agentId}:{userId}:{conversationId}
+    Relay에 직접 HTTP POST 하여 메시지를 저장하고 웹 클라이언트에 전달합니다.
+    """
+    relay_url = extra.get("url") or os.getenv("SKYTOWER_URL", "")
+    token     = extra.get("token") or os.getenv("SKYTOWER_TOKEN", "")
+
+    if not relay_url or not token:
+        return _error("Skytower SKYTOWER_URL or SKYTOWER_TOKEN not configured")
+
+    # chat_id 파싱: skytower:{agentId}:{userId}:{conversationId}
+    parts = chat_id.split(":")
+    try:
+        conversation_id = int(parts[3]) if len(parts) > 3 else None
+        user_id         = int(parts[2]) if len(parts) > 2 else None
+    except (ValueError, IndexError):
+        return _error(f"Invalid Skytower chat_id format: {chat_id}")
+
+    if not conversation_id and not user_id:
+        return _error(f"Cannot determine target from chat_id: {chat_id}")
+
+    payload: dict = {"content": message, "type": "text"}
+    if conversation_id:
+        payload["target_conversation_id"] = conversation_id
+    else:
+        payload["target_user_id"] = user_id
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{relay_url}/api/messages",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json() if resp.content else {}
+                return {
+                    "success": True,
+                    "platform": "skytower",
+                    "chat_id": chat_id,
+                    "message_id": str(data.get("id", "")),
+                }
+            return _error(f"Skytower send failed: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        return _error(f"Skytower send failed: {e}")
 
 
 # --- Registry ---
