@@ -72,7 +72,9 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
             if platform == Platform.DISCORD:
                 platforms["discord"] = _build_discord(adapter)
             elif platform == Platform.SLACK:
-                platforms["slack"] = await _build_slack(adapter)
+                platforms["slack"] = _build_slack(adapter)
+            elif platform == Platform.SKYTOWER:
+                platforms["skytower"] = _build_skytower(adapter)
         except Exception as e:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
 
@@ -206,6 +208,65 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
             seen_ids.add(entry.get("id"))
 
     return channels
+
+
+def _build_skytower(adapter) -> List[Dict[str, str]]:
+    """Skytower Relay REST API로 대화 목록을 조회해 채널 디렉터리를 구성합니다.
+
+    Relay API: GET /api/conversations
+    응답: [{"id": 3, "name": "New Chat", "user_id": 7, "user_name": "홍길동"}, ...]
+
+    API 조회 실패 시 세션 히스토리로 폴백합니다.
+    """
+    relay_url = getattr(adapter, "_relay_url", "") or ""
+    token     = getattr(adapter, "_token", "")     or ""
+    agent_id  = getattr(adapter, "_agent_id", "")  or ""
+
+    entries: List[Dict[str, str]] = []
+
+    if relay_url and token:
+        try:
+            import httpx
+            resp = httpx.get(
+                f"{relay_url}/api/conversations",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                for conv in resp.json():
+                    conv_id   = str(conv.get("id", ""))
+                    user_id   = str(conv.get("user_id", ""))
+                    user_name = conv.get("user_name") or f"User {user_id}"
+                    conv_name = conv.get("name") or "New Chat"
+
+                    if not conv_id or not user_id:
+                        continue
+
+                    # JID: skytower:{agentId}:{userId}:{conversationId}
+                    jid = f"skytower:{agent_id}:{user_id}:{conv_id}"
+                    entries.append({
+                        "id":      jid,
+                        "name":    f"{user_name} / {conv_name}",
+                        "user_id": user_id,
+                        "conv_id": conv_id,
+                        "type":    "dm",
+                    })
+                logger.debug(
+                    "Skytower channel directory: %d conversations from Relay API",
+                    len(entries),
+                )
+        except Exception as e:
+            logger.debug("Skytower Relay API unavailable, falling back to sessions: %s", e)
+
+    # 세션 히스토리와 병합 (API 미지원 대화 포함)
+    session_entries = _build_from_sessions("skytower")
+    seen_ids = {e["id"] for e in entries}
+    for se in session_entries:
+        if se["id"] not in seen_ids:
+            entries.append(se)
+            seen_ids.add(se["id"])
+
+    return entries
 
 
 def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
