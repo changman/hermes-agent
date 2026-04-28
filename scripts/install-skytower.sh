@@ -363,7 +363,16 @@ install_deps() {
 
     # ── Skytower 전용 의존성 ──────────────────────────────────────────────────
     log_info "Skytower 의존성 설치 중 (python-socketio, psutil)..."
-    if [ "$USE_VENV" = true ]; then
+    if [ "$DISTRO" = "termux" ]; then
+        "$INSTALL_DIR/venv/bin/python" -m pip install \
+            "python-socketio[asyncio_client]>=5.11" "psutil>=5.9" -q
+    elif [ "$USE_VENV" = true ] && [ -n "${UV_CMD:-}" ]; then
+        # uv venv에는 pip이 없으므로 uv pip 사용
+        export VIRTUAL_ENV="$INSTALL_DIR/venv"
+        $UV_CMD pip install "python-socketio[asyncio_client]>=5.11" "psutil>=5.9" -q
+    elif [ "$USE_VENV" = true ]; then
+        # pip이 없으면 ensurepip으로 먼저 설치
+        "$INSTALL_DIR/venv/bin/python" -m ensurepip -q 2>/dev/null || true
         "$INSTALL_DIR/venv/bin/python" -m pip install \
             "python-socketio[asyncio_client]>=5.11" "psutil>=5.9" -q
     else
