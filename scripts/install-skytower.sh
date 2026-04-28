@@ -363,20 +363,19 @@ install_deps() {
 
     # ── Skytower 전용 의존성 ──────────────────────────────────────────────────
     log_info "Skytower 의존성 설치 중 (python-socketio, psutil)..."
+    _skytower_pkgs="python-socketio[asyncio_client]>=5.11 psutil>=5.9"
     if [ "$DISTRO" = "termux" ]; then
-        "$INSTALL_DIR/venv/bin/python" -m pip install \
-            "python-socketio[asyncio_client]>=5.11" "psutil>=5.9" -q
-    elif [ "$USE_VENV" = true ] && [ -n "${UV_CMD:-}" ]; then
-        # uv venv에는 pip이 없으므로 uv pip 사용
+        # Termux: pip이 venv에 포함됨
+        "$INSTALL_DIR/venv/bin/python" -m pip install $_skytower_pkgs -q
+    elif [ -n "${UV_CMD:-}" ]; then
+        # uv 사용 (uv venv에는 pip이 없으므로 항상 uv pip 사용)
         export VIRTUAL_ENV="$INSTALL_DIR/venv"
-        $UV_CMD pip install "python-socketio[asyncio_client]>=5.11" "psutil>=5.9" -q
-    elif [ "$USE_VENV" = true ]; then
-        # pip이 없으면 ensurepip으로 먼저 설치
-        "$INSTALL_DIR/venv/bin/python" -m ensurepip -q 2>/dev/null || true
-        "$INSTALL_DIR/venv/bin/python" -m pip install \
-            "python-socketio[asyncio_client]>=5.11" "psutil>=5.9" -q
+        $UV_CMD pip install $_skytower_pkgs -q
     else
-        pip install "python-socketio[asyncio_client]>=5.11" "psutil>=5.9" -q
+        # fallback: ensurepip으로 pip 확보 후 설치
+        "$INSTALL_DIR/venv/bin/python" -m ensurepip -q 2>/dev/null || true
+        "$INSTALL_DIR/venv/bin/python" -m pip install $_skytower_pkgs -q \
+            || { log_warn "pip 실패, uv로 재시도..."; $UV_CMD pip install $_skytower_pkgs -q; }
     fi
     log_success "Skytower 의존성 설치 완료"
 
