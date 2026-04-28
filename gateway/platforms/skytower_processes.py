@@ -290,6 +290,7 @@ class ProcessManager:
         proc = await asyncio.create_subprocess_exec(
             str(hermes_bin), "gateway",
             env=env,
+            cwd=str(conv_home),
             stdout=log_file,
             stderr=log_file,
         )
@@ -343,6 +344,7 @@ class ProcessManager:
 
         env.update({
             "HERMES_HOME":         str(conv_home),
+            "TERMINAL_CWD":        str(conv_home),
             "API_SERVER_ENABLED":  "true",
             "API_SERVER_HOST":     "127.0.0.1",
             "API_SERVER_PORT":     str(port),

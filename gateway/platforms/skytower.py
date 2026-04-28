@@ -248,10 +248,7 @@ class SkyTowerAdapter(BasePlatformAdapter):
             return
 
         # 유저의 홈 채널 확인
-        user_home_conv  = self._get_user_home_conv(user_str)
-        is_home_channel = bool(
-            conv_str and conv_str == user_home_conv and self._process_mode
-        )
+        user_home_conv = self._get_user_home_conv(user_str)
 
         # chat_id 생성
         chat_id = (
@@ -260,14 +257,14 @@ class SkyTowerAdapter(BasePlatformAdapter):
             else f"skytower:{self._agent_id}:{user_str}"
         )
 
-        # 프로세스 모드 라우팅 (홈 채널 제외)
-        if self._process_mode and conv_str and not is_home_channel:
+        # 프로세스 모드 라우팅 (홈 채널 포함 모든 대화)
+        if self._process_mode and conv_str:
             if self._proc_mgr and self._proc_mgr.has_process(conv_str):
                 await self._handle_via_process(conv_str, user_str, user_name, content)
                 return
             elif self._process_auto_spawn:
                 await self._handle_via_process(conv_str, user_str, user_name, content)
-                if user_home_conv:
+                if user_home_conv and user_home_conv != conv_str:
                     await self._reply_conv(
                         user_home_conv,
                         f"🆕 Conv #{conv_str} — 프로세스가 자동으로 생성됐습니다.",
