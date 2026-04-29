@@ -126,6 +126,48 @@ class FileAccessHandler:
         if self._sio and self._sio.connected:
             await self._sio.emit(event, data)
 
+    # ── file:roots ────────────────────────────────────────────────────────────
+
+    async def handle_roots(self, data: dict) -> None:
+        """
+        Web UI가 탐색을 시작할 기준 디렉토리 목록을 반환합니다.
+        하드코딩된 경로(/workspace 등) 대신 이 이벤트로 실제 경로를 조회하세요.
+
+        data: { request_id: str }
+        emit: file:roots_result {
+                request_id,
+                home: str,       — 사용자 홈 디렉토리 (항상 존재)
+                cwd:  str,       — 에이전트 현재 작업 디렉토리
+                roots: [{ path, label }]  — Web UI 사이드바용 루트 목록
+              }
+        """
+        request_id = data.get("request_id", "")
+        logger.debug("file:roots received — request_id=%s", request_id)
+
+        home = str(Path.home().resolve())
+        cwd  = str(Path.cwd().resolve())
+
+        roots = [{"path": home, "label": "Home"}]
+        if cwd != home:
+            roots.append({"path": cwd, "label": "Working Directory"})
+
+        # HERMES_WRITE_SAFE_ROOT 가 설정된 경우 Workspace 항목 추가
+        safe_root = os.getenv("HERMES_WRITE_SAFE_ROOT", "")
+        if safe_root:
+            try:
+                resolved_root = str(Path(safe_root).expanduser().resolve())
+                if resolved_root not in (home, cwd) and Path(resolved_root).exists():
+                    roots.append({"path": resolved_root, "label": "Workspace"})
+            except Exception:
+                pass
+
+        await self._emit("file:roots_result", {
+            "request_id": request_id,
+            "home":       home,
+            "cwd":        cwd,
+            "roots":      roots,
+        })
+
     # ── file:list ─────────────────────────────────────────────────────────────
 
     async def handle_list(self, data: dict) -> None:
@@ -135,6 +177,7 @@ class FileAccessHandler:
         """
         request_id = data.get("request_id", "")
         raw_path   = data.get("path", "~")
+        logger.debug("file:list received — request_id=%s path=%s", request_id, raw_path)
 
         async def _err(msg: str) -> None:
             await self._emit("file:list_result", {"request_id": request_id, "error": msg})
@@ -179,6 +222,7 @@ class FileAccessHandler:
         """
         request_id = data.get("request_id", "")
         raw_path   = data.get("path", "")
+        logger.debug("file:read received — request_id=%s path=%s", request_id, raw_path)
 
         async def _err(msg: str) -> None:
             await self._emit("file:read_result", {"request_id": request_id, "error": msg})
@@ -260,6 +304,7 @@ class FileAccessHandler:
         """
         transfer_id = data.get("transfer_id", "")
         raw_path    = data.get("path", "")
+        logger.debug("file:download received — transfer_id=%s path=%s", transfer_id, raw_path)
 
         async def _err(msg: str) -> None:
             await self._emit("file:download_error", {"transfer_id": transfer_id, "error": msg})
@@ -322,6 +367,8 @@ class FileAccessHandler:
         transfer_id = data.get("transfer_id", "")
         raw_path    = data.get("path", "")
         total_size  = int(data.get("total_size", 0))
+        logger.debug("file:upload_start received — transfer_id=%s path=%s size=%d",
+                     transfer_id, raw_path, total_size)
 
         async def _err(msg: str) -> None:
             await self._emit("file:upload_start_result",
@@ -372,6 +419,8 @@ class FileAccessHandler:
               | { transfer_id, error }
         """
         transfer_id = data.get("transfer_id", "")
+        logger.debug("file:upload_chunk received — transfer_id=%s index=%s done=%s",
+                     transfer_id, data.get("index"), data.get("done"))
         state = self._upload_state.get(transfer_id)
 
         async def _err(msg: str) -> None:
@@ -435,6 +484,7 @@ class FileAccessHandler:
         """
         request_id = data.get("request_id", "")
         raw_path   = data.get("path", "")
+        logger.debug("file:delete received — request_id=%s path=%s", request_id, raw_path)
 
         async def _err(msg: str) -> None:
             await self._emit("file:delete_result",
