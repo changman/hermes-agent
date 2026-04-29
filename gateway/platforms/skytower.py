@@ -43,6 +43,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.platforms.skytower_files import FileAccessHandler
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,9 @@ class SkyTowerAdapter(BasePlatformAdapter):
         # Per-user home channel: {user_id → conv_id}
         self._home_channels: Dict[str, str] = _load_home_channels()
 
+        # File access handler — re-initialized in connect() with the live sio
+        self._file_handler: Optional[FileAccessHandler] = None
+
     # ── Per-user home channel ─────────────────────────────────────────────────
 
     def _get_user_home_conv(self, user_id: str) -> Optional[str]:
@@ -186,6 +190,37 @@ class SkyTowerAdapter(BasePlatformAdapter):
         @self._sio.on("message")
         async def on_message(data: dict):
             await self._handle_relay_message(data)
+
+        # ── 파일시스템 접근 이벤트 ───────────────────────────────────────────
+        # Web UI → Relay → Agent 방향으로 수신되는 file:* 이벤트를 처리합니다.
+        # 각 핸들러는 결과를 file:*_result / file:chunk 이벤트로 emit합니다.
+
+        self._file_handler = FileAccessHandler(self._sio)
+
+        @self._sio.on("file:list")
+        async def on_file_list(data: dict):
+            await self._file_handler.handle_list(data)
+
+        @self._sio.on("file:read")
+        async def on_file_read(data: dict):
+            await self._file_handler.handle_read(data)
+
+        @self._sio.on("file:download")
+        async def on_file_download(data: dict):
+            # 청크 스트리밍은 별도 태스크로 실행해 이벤트 루프를 블로킹하지 않습니다.
+            asyncio.create_task(self._file_handler.handle_download(data))
+
+        @self._sio.on("file:upload_start")
+        async def on_file_upload_start(data: dict):
+            await self._file_handler.handle_upload_start(data)
+
+        @self._sio.on("file:upload_chunk")
+        async def on_file_upload_chunk(data: dict):
+            await self._file_handler.handle_upload_chunk(data)
+
+        @self._sio.on("file:delete")
+        async def on_file_delete(data: dict):
+            await self._file_handler.handle_delete(data)
 
         try:
             await self._sio.connect(
