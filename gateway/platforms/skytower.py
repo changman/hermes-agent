@@ -106,6 +106,7 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._relay_url = extra.get("url") or os.getenv("SKYTOWER_URL", "")
         self._sio: Optional[Any] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._intentional_disconnect: bool = False
 
         # Process mode
         self._process_mode: bool = os.getenv(
@@ -149,12 +150,16 @@ class SkyTowerAdapter(BasePlatformAdapter):
 
         @self._sio.event
         async def connect():
+            self._intentional_disconnect = False
             self._mark_connected()
             logger.info(
                 "SkyTower connected: %s (agentId=%s, process_mode=%s)",
                 self._relay_url, self._agent_id, self._process_mode,
             )
             await self._sio.emit("heartbeat", self._collect_metrics())
+            # Restart heartbeat task if it exited after a previous disconnect
+            if self._heartbeat_task is None or self._heartbeat_task.done():
+                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             if os.getenv("SKYTOWER_PRINT_PAIR_CODE", "").lower() in ("1", "true", "yes"):
                 await self._print_pairing_code()
 
@@ -162,6 +167,21 @@ class SkyTowerAdapter(BasePlatformAdapter):
         async def disconnect():
             self._mark_disconnected()
             logger.warning("SkyTower disconnected")
+
+        @self._sio.on("__disconnect_final")
+        async def on_disconnect_final():
+            # Fires when socket.io will NOT auto-reconnect (server clean close or
+            # max reconnect attempts exhausted).  Intentional gateway-initiated
+            # disconnects set _intentional_disconnect=True to suppress this.
+            if self._intentional_disconnect:
+                return
+            logger.warning(
+                "SkyTower: socket.io gave up reconnecting — triggering gateway-level reconnect"
+            )
+            self._set_fatal_error(
+                "disconnected", "SkyTower server disconnected", retryable=True
+            )
+            await self._notify_fatal_error()
 
         @self._sio.on("message")
         async def on_message(data: dict):
@@ -182,6 +202,7 @@ class SkyTowerAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        self._intentional_disconnect = True
         self._running = False
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
