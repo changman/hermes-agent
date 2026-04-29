@@ -168,11 +168,13 @@ class ProcessManager:
         }
         url = f"http://127.0.0.1:{info.port}/v1/chat/completions"
 
+        logger.info("stream_response: POST %s (conv=%s)", url, conv_id)
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(connect=5, read=120, write=10, pool=5)
             ) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                    logger.info("stream_response: HTTP %s from conv %s", resp.status_code, conv_id)
                     resp.raise_for_status()
                     async for line in resp.aiter_lines():
                         if not line.startswith("data: "):
@@ -236,6 +238,15 @@ class ProcessManager:
                         safe_cfg["model"] = {"default": model_name}
                 else:
                     safe_cfg["model"] = model_cfg
+
+                # provider가 서브프로세스에서 인식 불가한 경우 제거.
+                # OPENAI_BASE_URL 등 env var로 auto-detect되므로 충분함.
+                _SUBPROCESS_UNSUPPORTED_PROVIDERS = {"ollama-launch"}
+                if (isinstance(safe_cfg.get("model"), dict)
+                        and safe_cfg["model"].get("provider") in _SUBPROCESS_UNSUPPORTED_PROVIDERS):
+                    safe_cfg["model"].pop("provider", None)
+                    safe_cfg["model"].pop("base_url", None)
+                    logger.debug("Removed unsupported provider from subprocess config")
 
             with open(config_yaml, "w", encoding="utf-8") as f:
                 _yaml.dump(safe_cfg, f, allow_unicode=True, default_flow_style=False)
@@ -327,10 +338,9 @@ class ProcessManager:
                     "You are Hermes, an AI assistant.\n"
                 )
 
-        # config.yaml: 메인 프로세스의 모델 설정을 복사 (플랫폼 토큰 제외)
+        # config.yaml: 스폰 시마다 메인 프로세스의 모델 설정을 동기화 (플랫폼 토큰 제외)
         config_yaml = conv_home / "config.yaml"
-        if not config_yaml.exists():
-            self._seed_conv_config(config_yaml)
+        self._seed_conv_config(config_yaml)
 
         return conv_home
 
