@@ -199,11 +199,17 @@ class SkyTowerAdapter(BasePlatformAdapter):
 
         @self._sio.on("file:list")
         async def on_file_list(data: dict):
-            await self._file_handler.handle_list(data)
+            try:
+                await self._file_handler.handle_list(data)
+            except Exception:
+                logger.exception("file:list handler error — data=%s", data)
 
         @self._sio.on("file:read")
         async def on_file_read(data: dict):
-            await self._file_handler.handle_read(data)
+            try:
+                await self._file_handler.handle_read(data)
+            except Exception:
+                logger.exception("file:read handler error — data=%s", data)
 
         @self._sio.on("file:download")
         async def on_file_download(data: dict):
@@ -212,15 +218,24 @@ class SkyTowerAdapter(BasePlatformAdapter):
 
         @self._sio.on("file:upload_start")
         async def on_file_upload_start(data: dict):
-            await self._file_handler.handle_upload_start(data)
+            try:
+                await self._file_handler.handle_upload_start(data)
+            except Exception:
+                logger.exception("file:upload_start handler error — data=%s", data)
 
         @self._sio.on("file:upload_chunk")
         async def on_file_upload_chunk(data: dict):
-            await self._file_handler.handle_upload_chunk(data)
+            try:
+                await self._file_handler.handle_upload_chunk(data)
+            except Exception:
+                logger.exception("file:upload_chunk handler error — data=%s", data)
 
         @self._sio.on("file:delete")
         async def on_file_delete(data: dict):
-            await self._file_handler.handle_delete(data)
+            try:
+                await self._file_handler.handle_delete(data)
+            except Exception:
+                logger.exception("file:delete handler error — data=%s", data)
 
         try:
             await self._sio.connect(
@@ -269,13 +284,19 @@ class SkyTowerAdapter(BasePlatformAdapter):
     # ── Inbound routing ───────────────────────────────────────────────────────
 
     async def _handle_relay_message(self, data: dict) -> None:
+        logger.debug("on_message received: direction=%r type=%r user_id=%r content=%r",
+                     data.get("direction"), data.get("type"),
+                     data.get("user_id"), str(data.get("content", ""))[:80])
         if data.get("direction") != "outbound":
+            logger.warning("on_message dropped: direction=%r (expected 'outbound')", data.get("direction"))
             return
         if data.get("type") != "text":
+            logger.warning("on_message dropped: type=%r (expected 'text')", data.get("type"))
             return
 
         user_id = data.get("user_id")
         if not user_id:
+            logger.warning("on_message dropped: user_id missing")
             return
 
         user_str  = str(user_id)
