@@ -74,6 +74,27 @@ def _resolve(raw: str) -> Path:
     return Path(raw).expanduser().resolve()
 
 
+def _session_cwd() -> Path:
+    """세션의 기본 작업 디렉토리를 반환합니다.
+
+    우선순위:
+      1. TERMINAL_CWD 환경변수 — 터미널 도구가 추적하는 현재 작업 디렉토리
+                                  (프로세스 모드 서브프로세스에서는 conv_home으로 설정됨)
+      2. HERMES_HOME — 프로세스 모드에서 conv_home이 HERMES_HOME으로 설정됨
+      3. 홈 디렉토리 (항상 존재)
+    """
+    for env_key in ("TERMINAL_CWD", "HERMES_HOME"):
+        val = os.getenv(env_key, "")
+        if val:
+            try:
+                p = Path(val).expanduser().resolve()
+                if p.exists() and p.is_dir():
+                    return p
+            except Exception:
+                pass
+    return Path.home().resolve()
+
+
 def _is_read_blocked(resolved: Path) -> Optional[str]:
     """읽기/목록 조회가 차단되어야 하면 오류 문자열을, 허용이면 None을 반환합니다."""
     err = get_read_block_error(str(resolved))
@@ -90,17 +111,29 @@ def _is_read_blocked(resolved: Path) -> Optional[str]:
 
 
 def _entry_info(p: Path) -> Dict[str, Any]:
-    """단일 파일/디렉토리 항목 정보를 딕셔너리로 반환합니다."""
+    """단일 파일/디렉토리 항목 정보를 딕셔너리로 반환합니다.
+
+    - path: Web UI가 절대 경로로 네비게이션할 수 있도록 full path 포함
+    - size: 디렉토리는 키를 제외 (null/0 대신 공백 표시를 위해)
+    """
+    is_dir = p.is_dir()
     try:
         st = p.stat()
-        return {
+        entry: Dict[str, Any] = {
             "name":  p.name,
-            "type":  "dir" if p.is_dir() else "file",
-            "size":  st.st_size if p.is_file() else None,
+            "path":  str(p),
+            "type":  "dir" if is_dir else "file",
             "mtime": st.st_mtime,
         }
+        if not is_dir:
+            entry["size"] = st.st_size
+        return entry
     except OSError:
-        return {"name": p.name, "type": "unknown", "size": None, "mtime": None}
+        return {
+            "name": p.name,
+            "path": str(p),
+            "type": "dir" if is_dir else "unknown",
+        }
 
 
 def _guess_mime(path: Path) -> str:
@@ -144,28 +177,29 @@ class FileAccessHandler:
         request_id = data.get("request_id", "")
         logger.debug("file:roots received — request_id=%s", request_id)
 
-        home = str(Path.home().resolve())
-        cwd  = str(Path.cwd().resolve())
+        session_cwd = str(_session_cwd())
+        home        = str(Path.home().resolve())
 
-        roots = [{"path": home, "label": "Home"}]
-        if cwd != home:
-            roots.append({"path": cwd, "label": "Working Directory"})
+        # 세션 작업 디렉토리를 최상단에 배치
+        roots: list = [{"path": session_cwd, "label": "Working Directory"}]
+        if home != session_cwd:
+            roots.append({"path": home, "label": "Home"})
 
         # HERMES_WRITE_SAFE_ROOT 가 설정된 경우 Workspace 항목 추가
         safe_root = os.getenv("HERMES_WRITE_SAFE_ROOT", "")
         if safe_root:
             try:
                 resolved_root = str(Path(safe_root).expanduser().resolve())
-                if resolved_root not in (home, cwd) and Path(resolved_root).exists():
+                if resolved_root not in (session_cwd, home) and Path(resolved_root).exists():
                     roots.append({"path": resolved_root, "label": "Workspace"})
             except Exception:
                 pass
 
         await self._emit("file:roots_result", {
-            "request_id": request_id,
-            "home":       home,
-            "cwd":        cwd,
-            "roots":      roots,
+            "request_id":  request_id,
+            "home":        home,
+            "cwd":         session_cwd,
+            "roots":       roots,
         })
 
     # ── file:list ─────────────────────────────────────────────────────────────
@@ -192,9 +226,25 @@ class FileAccessHandler:
             await _err(blocked)
             return
 
+        session_root = _session_cwd()
+
         if not resolved.exists():
-            await _err(f"Path not found: {resolved}")
-            return
+            # 요청 경로가 없으면 세션 작업 디렉토리로 폴백 (예: /workspace → conv_home)
+            logger.info(
+                "file:list path not found (%s), falling back to session root: %s",
+                resolved, session_root,
+            )
+            resolved = session_root
+
+        # 루트 경계 강제: 세션 작업 디렉토리 상위로 이동 불가
+        try:
+            resolved.relative_to(session_root)
+        except ValueError:
+            logger.info(
+                "file:list path above session root (%s), clamping to: %s",
+                resolved, session_root,
+            )
+            resolved = session_root
 
         if not resolved.is_dir():
             await _err(f"Not a directory: {resolved}")
@@ -206,9 +256,24 @@ class FileAccessHandler:
             await _err(f"Permission denied: {e}")
             return
 
+        # 루트가 아닌 경우 상위 이동 엔트리 "[..]" 추가
+        if resolved != session_root:
+            parent = resolved.parent
+            # 부모가 세션 루트보다 상위면 루트로 클램핑
+            try:
+                parent.relative_to(session_root)
+            except ValueError:
+                parent = session_root
+            entries.insert(0, {
+                "name": "..",
+                "path": str(parent),
+                "type": "dir",
+            })
+
         await self._emit("file:list_result", {
             "request_id": request_id,
             "path":       str(resolved),
+            "root":       str(session_root),
             "entries":    entries,
         })
 
