@@ -74,15 +74,35 @@ def _resolve(raw: str) -> Path:
     return Path(raw).expanduser().resolve()
 
 
-def _session_cwd() -> Path:
+def _session_cwd(conv_id: Optional[str] = None) -> Path:
     """세션의 기본 작업 디렉토리를 반환합니다.
 
     우선순위:
-      1. TERMINAL_CWD 환경변수 — 터미널 도구가 추적하는 현재 작업 디렉토리
-                                  (프로세스 모드 서브프로세스에서는 conv_home으로 설정됨)
-      2. HERMES_HOME — 프로세스 모드에서 conv_home이 HERMES_HOME으로 설정됨
-      3. 홈 디렉토리 (항상 존재)
+      1. conv_id 제공 시 → get_hermes_home() / "convs" / conv_id
+         (메인 프로세스에서도 각 서브 에이전트의 격리 경로를 직접 계산)
+      2. TERMINAL_CWD 환경변수 (단일 프로세스 모드용)
+      3. HERMES_HOME 환경변수
+      4. 홈 디렉토리 (항상 존재)
+
+    왜 conv_id가 필요한가:
+      FileAccessHandler는 메인 프로세스에서 실행되며, TERMINAL_CWD / HERMES_HOME은
+      메인 프로세스의 값(공유 루트)을 가리킨다. conv_home으로 설정된 값은
+      서브프로세스 환경변수에만 존재하므로 메인 프로세스에서는 읽을 수 없다.
+      따라서 Relay가 file:* 이벤트에 conv_id를 주입하고, 메인 프로세스가
+      get_hermes_home() / "convs" / conv_id 로 직접 경로를 계산해야 한다.
     """
+    # 1. conv_id 기반 격리 경로 (프로세스 모드)
+    if conv_id:
+        try:
+            from hermes_constants import get_hermes_home
+            conv_home = get_hermes_home() / "convs" / str(conv_id)
+            resolved = conv_home.resolve()
+            if resolved.exists() and resolved.is_dir():
+                return resolved
+        except Exception:
+            pass
+
+    # 2-3. 환경변수 폴백 (단일 프로세스 모드 또는 conv_id 미제공 시)
     for env_key in ("TERMINAL_CWD", "HERMES_HOME"):
         val = os.getenv(env_key, "")
         if val:
@@ -92,6 +112,8 @@ def _session_cwd() -> Path:
                     return p
             except Exception:
                 pass
+
+    # 4. 최종 폴백
     return Path.home().resolve()
 
 
@@ -175,9 +197,10 @@ class FileAccessHandler:
               }
         """
         request_id = data.get("request_id", "")
-        logger.debug("file:roots received — request_id=%s", request_id)
+        conv_id    = data.get("conv_id")
+        logger.debug("file:roots received — request_id=%s conv_id=%s", request_id, conv_id)
 
-        session_cwd = str(_session_cwd())
+        session_cwd = str(_session_cwd(conv_id))
         home        = str(Path.home().resolve())
 
         # 세션 작업 디렉토리를 최상단에 배치
@@ -211,7 +234,9 @@ class FileAccessHandler:
         """
         request_id = data.get("request_id", "")
         raw_path   = data.get("path", "~")
-        logger.debug("file:list received — request_id=%s path=%s", request_id, raw_path)
+        conv_id    = data.get("conv_id")
+        logger.debug("file:list received — request_id=%s path=%s conv_id=%s",
+                     request_id, raw_path, conv_id)
 
         async def _err(msg: str) -> None:
             await self._emit("file:list_result", {"request_id": request_id, "error": msg})
@@ -226,7 +251,7 @@ class FileAccessHandler:
             await _err(blocked)
             return
 
-        session_root = _session_cwd()
+        session_root = _session_cwd(conv_id)
 
         if not resolved.exists():
             # 요청 경로가 없으면 세션 작업 디렉토리로 폴백 (예: /workspace → conv_home)
