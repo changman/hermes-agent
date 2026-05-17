@@ -470,12 +470,10 @@ class SkyTowerAdapter(BasePlatformAdapter):
         await self._reply_conv(home_conv_id, f"⏳ Conv #{conv_id} 프로세스 생성 중...")
         try:
             info = await self._proc_mgr.get_or_create(conv_id)
-            from hermes_constants import get_hermes_home
             await self._reply_conv(home_conv_id,
                 f"✅ Conv #{conv_id} 프로세스 연결 완료\n"
                 f"• PID: {info.proc.pid}\n"
-                f"• Port: {info.port}\n"
-                f"• HERMES_HOME: `{get_hermes_home()}/convs/{conv_id}/`"
+                f"• Port: {info.port}"
             )
         except Exception as e:
             logger.error("Process start failed for conv %s: %s", conv_id, e)
@@ -534,14 +532,13 @@ class SkyTowerAdapter(BasePlatformAdapter):
         info  = next((p for p in procs if p["conv_id"] == conv_id), None)
         if info:
             from hermes_constants import get_hermes_home
-            conv_home = get_hermes_home() / "convs" / conv_id
+            log_path = get_hermes_home() / "logs" / f"conv_{conv_id}_api_server.log"
             await self._reply_conv(home_conv_id,
                 f"**Conv #{conv_id} 프로세스 정보**\n"
                 f"• PID: {info['pid']}\n"
                 f"• Port: {info['port']}\n"
                 f"• Idle: {info['idle_seconds']}초\n"
-                f"• HERMES_HOME: `{conv_home}/`\n"
-                f"• Log: `{conv_home}/logs/api_server.log`"
+                f"• Log: `{log_path}`"
             )
 
     # ── 프로세스 응답 스트리밍 ────────────────────────────────────────────────

@@ -45,7 +45,6 @@ import json
 import logging
 import os
 import secrets
-import shutil
 import socket as _socket
 import sys
 import time
@@ -217,81 +216,18 @@ class ProcessManager:
             if info.proc.returncode is None
         ]
 
-    # ── Config seeding ────────────────────────────────────────────────────────
-
-    def _seed_conv_config(self, config_yaml: Path) -> None:
-        """메인 HERMES_HOME의 모델 설정을 서브프로세스 config.yaml에 복사합니다."""
-        try:
-            import yaml as _yaml
-            parent = self._hermes_home / "config.yaml"
-            safe_cfg: dict = {"session_reset": {"mode": "none"}}
-
-            if parent.exists():
-                with open(parent, encoding="utf-8") as f:
-                    cfg = _yaml.safe_load(f) or {}
-
-                model_cfg = cfg.get("model")
-                # 모델이 빈 문자열이면 세션 히스토리에서 실제 사용 모델 탐색
-                if not model_cfg or (isinstance(model_cfg, str) and not model_cfg.strip()):
-                    model_name = self._infer_model_from_sessions()
-                    if model_name:
-                        safe_cfg["model"] = {"default": model_name}
-                else:
-                    safe_cfg["model"] = model_cfg
-
-                # provider가 서브프로세스에서 인식 불가한 경우 제거.
-                # OPENAI_BASE_URL 등 env var로 auto-detect되므로 충분함.
-                _SUBPROCESS_UNSUPPORTED_PROVIDERS = {"ollama-launch"}
-                if (isinstance(safe_cfg.get("model"), dict)
-                        and safe_cfg["model"].get("provider") in _SUBPROCESS_UNSUPPORTED_PROVIDERS):
-                    safe_cfg["model"].pop("provider", None)
-                    safe_cfg["model"].pop("base_url", None)
-                    logger.debug("Removed unsupported provider from subprocess config")
-
-            with open(config_yaml, "w", encoding="utf-8") as f:
-                _yaml.dump(safe_cfg, f, allow_unicode=True, default_flow_style=False)
-            logger.debug("Seeded config.yaml: %s", safe_cfg.get("model"))
-        except Exception as e:
-            logger.warning("Failed to seed conv config: %s", e)
-            config_yaml.write_text(
-                "# Auto-generated for conversation subprocess\n"
-                "session_reset:\n"
-                "  mode: none\n"
-            )
-
-    def _infer_model_from_sessions(self) -> Optional[str]:
-        """세션 파일에서 가장 최근에 사용된 모델명을 추출합니다."""
-        import glob as _glob
-        sessions_dir = self._hermes_home / "sessions"
-        pattern = str(sessions_dir / "session_*.json")
-        latest_model = ""
-        latest_ts = ""
-        for path in _glob.glob(pattern):
-            try:
-                import json as _json
-                data = _json.loads(Path(path).read_text())
-                model = data.get("model", "")
-                ts = data.get("last_updated", "")
-                if model and ts > latest_ts:
-                    latest_model = model
-                    latest_ts = ts
-            except Exception:
-                continue
-        return latest_model or None
-
     # ── Process spawn ─────────────────────────────────────────────────────────
 
     async def _spawn(self, conv_id: str) -> ProcessInfo:
-        conv_home = self._ensure_conv_home(conv_id)
-        port      = self._find_free_port()
-        api_key   = secrets.token_urlsafe(32)
+        port    = self._find_free_port()
+        api_key = secrets.token_urlsafe(32)
 
-        env = self._build_env(conv_home, port, api_key)
+        env = self._build_env(port, api_key)
 
-        # 로그 파일 (conv_home/logs/api_server.log)
-        log_dir  = conv_home / "logs"
+        # 로그 파일 — 대화별 로그는 hermes_home/logs/ 아래에 분리
+        log_dir = self._hermes_home / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = open(log_dir / "api_server.log", "a", buffering=1)
+        log_file = open(log_dir / f"conv_{conv_id}_api_server.log", "a", buffering=1)
 
         # hermes 실행파일 경로 (현재 프로세스와 동일한 venv 사용)
         hermes_bin = Path(sys.executable).parent / "hermes"
@@ -301,13 +237,13 @@ class ProcessManager:
         proc = await asyncio.create_subprocess_exec(
             str(hermes_bin), "gateway",
             env=env,
-            cwd=str(conv_home),
+            cwd=str(Path.home()),
             stdout=log_file,
             stderr=log_file,
         )
         logger.info(
             "Spawned hermes process for conv %s: pid=%d port=%d home=%s",
-            conv_id, proc.pid, port, conv_home,
+            conv_id, proc.pid, port, self._hermes_home,
         )
 
         await self._wait_ready(port, conv_id)
@@ -320,31 +256,7 @@ class ProcessManager:
             log_file=log_file,
         )
 
-    def _ensure_conv_home(self, conv_id: str) -> Path:
-        """Create and seed the conversation HERMES_HOME directory."""
-        conv_home = self._hermes_home / "convs" / str(conv_id)
-        for sub in ("sessions", "memories", "skills", "cron", "logs"):
-            (conv_home / sub).mkdir(parents=True, exist_ok=True)
-
-        # CLAUDE.md: 부모 CLAUDE.md 복사, 없으면 기본값
-        claude_md = conv_home / "CLAUDE.md"
-        if not claude_md.exists():
-            parent_md = self._hermes_home / "CLAUDE.md"
-            if parent_md.exists():
-                shutil.copy2(parent_md, claude_md)
-            else:
-                claude_md.write_text(
-                    f"# Hermes — Conversation {conv_id}\n\n"
-                    "You are Hermes, an AI assistant.\n"
-                )
-
-        # config.yaml: 스폰 시마다 메인 프로세스의 모델 설정을 동기화 (플랫폼 토큰 제외)
-        config_yaml = conv_home / "config.yaml"
-        self._seed_conv_config(config_yaml)
-
-        return conv_home
-
-    def _build_env(self, conv_home: Path, port: int, api_key: str) -> Dict[str, str]:
+    def _build_env(self, port: int, api_key: str) -> Dict[str, str]:
         env: Dict[str, str] = {}
         # 필요한 환경변수만 전달
         for key in self._env_passthrough:
@@ -353,8 +265,8 @@ class ProcessManager:
                 env[key] = val
 
         env.update({
-            "HERMES_HOME":         str(conv_home),
-            "TERMINAL_CWD":        str(conv_home),
+            "HERMES_HOME":         str(self._hermes_home),
+            "TERMINAL_CWD":        str(Path.home()),
             "API_SERVER_ENABLED":  "true",
             "API_SERVER_HOST":     "127.0.0.1",
             "API_SERVER_PORT":     str(port),
