@@ -36,57 +36,21 @@ def _fake_proc(pid=1234, returncode=None):
 
 
 # ---------------------------------------------------------------------------
-# conv_home setup
-# ---------------------------------------------------------------------------
-
-class TestConvHomeSetup:
-    def test_creates_subdirectories(self, tmp_path):
-        mgr       = _make_manager(tmp_path)
-        conv_home = mgr._ensure_conv_home("42")
-        for sub in ("sessions", "memories", "skills", "cron", "logs"):
-            assert (conv_home / sub).is_dir()
-
-    def test_seeds_claude_md_from_parent(self, tmp_path):
-        (tmp_path / "CLAUDE.md").write_text("# Parent")
-        mgr       = _make_manager(tmp_path)
-        conv_home = mgr._ensure_conv_home("5")
-        assert (conv_home / "CLAUDE.md").read_text() == "# Parent"
-
-    def test_creates_default_claude_md_when_no_parent(self, tmp_path):
-        mgr       = _make_manager(tmp_path)
-        conv_home = mgr._ensure_conv_home("99")
-        assert "99" in (conv_home / "CLAUDE.md").read_text()
-
-    def test_does_not_overwrite_existing_claude_md(self, tmp_path):
-        conv_home = tmp_path / "convs" / "7"
-        conv_home.mkdir(parents=True)
-        custom = conv_home / "CLAUDE.md"
-        custom.write_text("# Custom")
-        _make_manager(tmp_path)._ensure_conv_home("7")
-        assert custom.read_text() == "# Custom"
-
-    def test_creates_config_yaml(self, tmp_path):
-        mgr       = _make_manager(tmp_path)
-        conv_home = mgr._ensure_conv_home("3")
-        assert (conv_home / "config.yaml").exists()
-
-
-# ---------------------------------------------------------------------------
 # _build_env
 # ---------------------------------------------------------------------------
 
 class TestBuildEnv:
     def test_api_server_vars_set(self, tmp_path):
         mgr = _make_manager(tmp_path)
-        env = mgr._build_env(tmp_path / "convs" / "3", 19003, "secret")
+        env = mgr._build_env(19003, "secret")
         assert env["API_SERVER_ENABLED"] == "true"
         assert env["API_SERVER_PORT"]    == "19003"
         assert env["API_SERVER_KEY"]     == "secret"
-        assert env["HERMES_HOME"]        == str(tmp_path / "convs" / "3")
+        assert env["HERMES_HOME"]        == str(tmp_path)
 
     def test_skytower_tokens_cleared(self, tmp_path):
         mgr = _make_manager(tmp_path)
-        env = mgr._build_env(tmp_path / "convs" / "3", 19003, "key")
+        env = mgr._build_env(19003, "key")
         assert env["SKYTOWER_TOKEN"]     == ""
         assert env["SKYTOWER_URL"]       == ""
         assert env["TELEGRAM_BOT_TOKEN"] == ""
@@ -94,12 +58,12 @@ class TestBuildEnv:
     def test_api_keys_forwarded(self, tmp_path, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
         mgr = _make_manager(tmp_path)
-        env = mgr._build_env(tmp_path / "convs" / "3", 19003, "key")
+        env = mgr._build_env(19003, "key")
         assert env["ANTHROPIC_API_KEY"] == "sk-ant-test"
 
     def test_host_is_loopback(self, tmp_path):
         mgr = _make_manager(tmp_path)
-        env = mgr._build_env(tmp_path / "convs" / "3", 19003, "key")
+        env = mgr._build_env(19003, "key")
         assert env["API_SERVER_HOST"] == "127.0.0.1"
 
 
@@ -310,6 +274,8 @@ class TestAdapterProcessMode:
     async def test_normal_message_in_home_channel_uses_standard_mode(self, monkeypatch):
         adapter = self._make_adapter(monkeypatch, user_home={"7": "1"})
         adapter.handle_message = AsyncMock()
+        # 홈 채널 conv에 실행 중인 프로세스가 없으면 표준 모드로 처리됩니다.
+        adapter._proc_mgr.has_process.return_value = False
 
         await adapter._handle_relay_message({
             "direction": "outbound", "type": "text",
