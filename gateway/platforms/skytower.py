@@ -9,24 +9,6 @@ Per-user Home Channel
 ---------------------
 각 유저가 /sethome 명령으로 자신의 홈 채널을 지정합니다.
 설정은 ~/.hermes/skytower_home_channels.json 에 유저별로 저장됩니다.
-정적 환경변수 없음 — 모두 런타임에 동적으로 설정.
-
-Process Mode (SKYTOWER_PROCESS_MODE=true)
------------------------------------------
-conversation_id별로 독립된 Hermes 프로세스를 띄웁니다.
-각 프로세스는 자체 HERMES_HOME을 가지며 Docker 없이 동작합니다.
-
-홈 채널에서 사용하는 명령어:
-  /sethome                     — 현재 대화를 내 홈 채널로 설정
-  /process start <conv_id>     — 프로세스 생성 및 conversation 연결
-  /process stop  <conv_id>     — 프로세스 종료
-  /process list                — 실행 중인 프로세스 목록
-  /process info  <conv_id>     — 프로세스 상세 정보
-  /process restart <conv_id>   — 프로세스 재시작
-
-Auto-spawn (SKYTOWER_PROCESS_AUTO_SPAWN=true)
----------------------------------------------
-첫 메시지가 도착한 conversation에 자동으로 프로세스를 생성합니다.
 """
 
 import asyncio
@@ -34,7 +16,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -109,15 +91,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._intentional_disconnect: bool = False
 
-        # Process mode
-        self._process_mode: bool = os.getenv(
-            "SKYTOWER_PROCESS_MODE", ""
-        ).lower() in ("1", "true", "yes")
-        self._process_auto_spawn: bool = os.getenv(
-            "SKYTOWER_PROCESS_AUTO_SPAWN", ""
-        ).lower() in ("1", "true", "yes")
-        self._proc_mgr: Optional[Any] = None  # ProcessManager
-
         # Per-user home channel: {user_id → conv_id}
         self._home_channels: Dict[str, str] = _load_home_channels()
 
@@ -141,9 +114,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
             logger.error("SKYTOWER_URL is not set")
             return False
 
-        if self._process_mode:
-            await self._init_process_manager()
-
         import socketio
 
         self._sio = socketio.AsyncClient(
@@ -157,11 +127,10 @@ class SkyTowerAdapter(BasePlatformAdapter):
             self._intentional_disconnect = False
             self._mark_connected()
             logger.info(
-                "SkyTower connected: %s (agentId=%s, process_mode=%s)",
-                self._relay_url, self._agent_id, self._process_mode,
+                "SkyTower connected: %s (agentId=%s)",
+                self._relay_url, self._agent_id,
             )
             await self._sio.emit("heartbeat", self._collect_metrics())
-            # Restart heartbeat task if it exited after a previous disconnect
             if self._heartbeat_task is None or self._heartbeat_task.done():
                 self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             if os.getenv("SKYTOWER_PRINT_PAIR_CODE", "").lower() in ("1", "true", "yes"):
@@ -174,9 +143,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
 
         @self._sio.on("__disconnect_final")
         async def on_disconnect_final():
-            # Fires when socket.io will NOT auto-reconnect (server clean close or
-            # max reconnect attempts exhausted).  Intentional gateway-initiated
-            # disconnects set _intentional_disconnect=True to suppress this.
             if self._intentional_disconnect:
                 return
             logger.warning(
@@ -192,8 +158,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
             await self._handle_relay_message(data)
 
         # ── 파일시스템 접근 이벤트 ───────────────────────────────────────────
-        # Web UI → Relay → Agent 방향으로 수신되는 file:* 이벤트를 처리합니다.
-        # 각 핸들러는 결과를 file:*_result / file:chunk 이벤트로 emit합니다.
 
         self._file_handler = FileAccessHandler(self._sio)
 
@@ -213,7 +177,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
 
         @self._sio.on("file:download")
         async def on_file_download(data: dict):
-            # 청크 스트리밍은 별도 태스크로 실행해 이벤트 루프를 블로킹하지 않습니다.
             asyncio.create_task(self._file_handler.handle_download(data))
 
         @self._sio.on("file:upload_start")
@@ -256,30 +219,9 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._running = False
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
-        if self._proc_mgr:
-            await self._proc_mgr.stop()
         if self._sio:
             await self._sio.disconnect()
         self._mark_disconnected()
-
-    # ── Process manager init ──────────────────────────────────────────────────
-
-    async def _init_process_manager(self) -> None:
-        from gateway.platforms.skytower_processes import ProcessManager
-        from hermes_constants import get_hermes_home
-
-        self._proc_mgr = ProcessManager(
-            hermes_home=get_hermes_home(),
-            idle_ttl=int(os.getenv("SKYTOWER_PROCESS_IDLE_TTL", "3600")),
-            port_base=int(os.getenv("SKYTOWER_PROCESS_PORT_BASE", "19000")),
-            startup_timeout=int(os.getenv("SKYTOWER_PROCESS_STARTUP_TIMEOUT", "30")),
-        )
-        await self._proc_mgr.start()
-        logger.info(
-            "Process mode active — idle_ttl=%ss auto_spawn=%s",
-            os.getenv("SKYTOWER_PROCESS_IDLE_TTL", "3600"),
-            self._process_auto_spawn,
-        )
 
     # ── Inbound routing ───────────────────────────────────────────────────────
 
@@ -304,10 +246,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
         user_name = data.get("user_name") or f"User {user_id}"
         content   = (data.get("content") or "").strip()
 
-        # ── Skytower 전용 커맨드 ─────────────────────────────────────────────────
-        # Hermes 게이트웨이의 슬래시 커맨드 인터셉터(run.py)에 도달하기 전에
-        # 여기서 처리해야 "Unknown command" 오류가 발생하지 않습니다.
-
         if content == "/chatid":
             await self._handle_chatid(user_str, conv_str)
             return
@@ -320,35 +258,12 @@ class SkyTowerAdapter(BasePlatformAdapter):
                     "❌ `/sethome`은 대화방 안에서만 사용할 수 있습니다.")
             return
 
-        if content.startswith("/process"):
-            await self._dispatch_process_command(content, user_str, conv_str)
-            return
-
-        # 유저의 홈 채널 확인
-        user_home_conv = self._get_user_home_conv(user_str)
-
-        # chat_id 생성
         chat_id = (
             f"skytower:{self._agent_id}:{user_str}:{conv_str}"
             if conv_str
             else f"skytower:{self._agent_id}:{user_str}"
         )
 
-        # 프로세스 모드 라우팅 (홈 채널 포함 모든 대화)
-        if self._process_mode and conv_str:
-            if self._proc_mgr and self._proc_mgr.has_process(conv_str):
-                await self._handle_via_process(conv_str, user_str, user_name, content)
-                return
-            elif self._process_auto_spawn:
-                await self._handle_via_process(conv_str, user_str, user_name, content)
-                if user_home_conv and user_home_conv != conv_str:
-                    await self._reply_conv(
-                        user_home_conv,
-                        f"🆕 Conv #{conv_str} — 프로세스가 자동으로 생성됐습니다.",
-                    )
-                return
-
-        # 표준 모드: 공유 Hermes 에이전트
         source = self.build_source(
             chat_id=chat_id,
             chat_name=user_name,
@@ -363,34 +278,7 @@ class SkyTowerAdapter(BasePlatformAdapter):
             message_id=str(data.get("id", "")),
         ))
 
-    # ── /process 진입점 (항상 어댑터에서 처리) ───────────────────────────────
-
-    async def _dispatch_process_command(
-        self, content: str, user_id: str, conv_id: Optional[str]
-    ) -> None:
-        """SKYTOWER_PROCESS_MODE 및 홈채널 설정 여부를 확인 후 커맨드를 실행합니다."""
-        if not self._process_mode:
-            await self._reply_user(user_id, conv_id,
-                "❌ 프로세스 모드가 비활성화 상태입니다.\n"
-                "`.env`에 `SKYTOWER_PROCESS_MODE=true`를 추가하고 "
-                "`hermes gateway`를 재시작하세요.")
-            return
-
-        user_home_conv = self._get_user_home_conv(user_id)
-        if not user_home_conv:
-            await self._reply_user(user_id, conv_id,
-                "❌ 홈 채널이 설정되지 않았습니다.\n"
-                "먼저 홈 채널로 사용할 대화방에서 `/sethome`을 입력하세요.")
-            return
-
-        if conv_id != user_home_conv:
-            await self._reply_user(user_id, conv_id,
-                f"❌ `/process` 커맨드는 홈 채널(Conv #{user_home_conv})에서만 사용할 수 있습니다.")
-            return
-
-        await self._handle_process_command(content, user_id, conv_id)
-
-    # ── 메시지 전송 헬퍼 (conv_id 유무에 따라 라우팅) ─────────────────────────
+    # ── 메시지 전송 헬퍼 ──────────────────────────────────────────────────────
 
     async def _reply_user(
         self, user_id: str, conv_id: Optional[str], text: str
@@ -404,10 +292,17 @@ class SkyTowerAdapter(BasePlatformAdapter):
             payload["target_user_id"] = int(user_id)
         await self._sio.emit("message_done", payload)
 
+    async def _reply_conv(self, conv_id: str, text: str) -> None:
+        if self._sio and self._sio.connected:
+            await self._sio.emit("message_done", {
+                "content": text,
+                "type": "text",
+                "target_conversation_id": int(conv_id),
+            })
+
     # ── /chatid ───────────────────────────────────────────────────────────────
 
     async def _handle_chatid(self, user_id: str, conv_id: Optional[str]) -> None:
-        """현재 채팅방의 JID를 응답합니다."""
         if conv_id:
             jid = f"skytower:{self._agent_id}:{user_id}:{conv_id}"
         else:
@@ -438,143 +333,8 @@ class SkyTowerAdapter(BasePlatformAdapter):
         msg = "✅ 이 대화가 홈 채널로 설정됐습니다."
         if prev and prev != conv_id:
             msg += f"\n이전 홈 채널: Conv #{prev}"
-        if self._process_mode:
-            msg += "\n\n`/process help` 로 프로세스 관리 명령어를 확인하세요."
 
         await self._reply_conv(conv_id, msg)
-
-    # ── /process 커맨드 ───────────────────────────────────────────────────────
-
-    async def _handle_process_command(
-        self, text: str, user_id: str, home_conv_id: str
-    ) -> None:
-        parts = text.strip().split()
-        sub   = parts[1] if len(parts) > 1 else ""
-        arg   = parts[2] if len(parts) > 2 else ""
-
-        if   sub == "list":               await self._cmd_list(home_conv_id)
-        elif sub == "start"   and arg:    await self._cmd_start(arg, home_conv_id)
-        elif sub == "stop"    and arg:    await self._cmd_stop(arg, home_conv_id)
-        elif sub == "restart" and arg:    await self._cmd_restart(arg, home_conv_id)
-        elif sub == "info"    and arg:    await self._cmd_info(arg, home_conv_id)
-        else:                             await self._reply_conv(home_conv_id, _HELP_TEXT)
-
-    async def _cmd_start(self, conv_id: str, home_conv_id: str) -> None:
-        if not self._proc_mgr:
-            await self._reply_conv(home_conv_id, "❌ 프로세스 모드가 비활성화 상태입니다.")
-            return
-        if self._proc_mgr.has_process(conv_id):
-            await self._reply_conv(home_conv_id,
-                f"ℹ️ Conv #{conv_id}는 이미 프로세스가 실행 중입니다.")
-            return
-        await self._reply_conv(home_conv_id, f"⏳ Conv #{conv_id} 프로세스 생성 중...")
-        try:
-            info = await self._proc_mgr.get_or_create(conv_id)
-            await self._reply_conv(home_conv_id,
-                f"✅ Conv #{conv_id} 프로세스 연결 완료\n"
-                f"• PID: {info.proc.pid}\n"
-                f"• Port: {info.port}"
-            )
-        except Exception as e:
-            logger.error("Process start failed for conv %s: %s", conv_id, e)
-            await self._reply_conv(home_conv_id,
-                f"❌ 프로세스 생성 실패 (conv #{conv_id}): {e}")
-
-    async def _cmd_stop(self, conv_id: str, home_conv_id: str) -> None:
-        if not self._proc_mgr:
-            await self._reply_conv(home_conv_id, "❌ 프로세스 모드가 비활성화 상태입니다.")
-            return
-        stopped = await self._proc_mgr.shutdown_conversation(conv_id)
-        if stopped:
-            await self._reply_conv(home_conv_id, f"🛑 Conv #{conv_id} 프로세스 종료 완료.")
-        else:
-            await self._reply_conv(home_conv_id,
-                f"ℹ️ Conv #{conv_id}에 실행 중인 프로세스가 없습니다.")
-
-    async def _cmd_restart(self, conv_id: str, home_conv_id: str) -> None:
-        if not self._proc_mgr:
-            await self._reply_conv(home_conv_id, "❌ 프로세스 모드가 비활성화 상태입니다.")
-            return
-        await self._reply_conv(home_conv_id, f"🔄 Conv #{conv_id} 프로세스 재시작 중...")
-        await self._proc_mgr.shutdown_conversation(conv_id)
-        try:
-            info = await self._proc_mgr.get_or_create(conv_id)
-            await self._reply_conv(home_conv_id,
-                f"✅ Conv #{conv_id} 재시작 완료 (pid: {info.proc.pid}, port: {info.port})")
-        except Exception as e:
-            await self._reply_conv(home_conv_id, f"❌ 재시작 실패: {e}")
-
-    async def _cmd_list(self, home_conv_id: str) -> None:
-        if not self._proc_mgr:
-            await self._reply_conv(home_conv_id, "❌ 프로세스 모드가 비활성화 상태입니다.")
-            return
-        procs = await self._proc_mgr.list_processes()
-        if not procs:
-            await self._reply_conv(home_conv_id, "📭 실행 중인 프로세스가 없습니다.")
-            return
-        lines = ["**실행 중인 프로세스 목록**\n"]
-        for p in procs:
-            lines.append(
-                f"• Conv #{p['conv_id']} — pid {p['pid']} "
-                f"port {p['port']} (idle: {p['idle_seconds'] // 60}분)"
-            )
-        await self._reply_conv(home_conv_id, "\n".join(lines))
-
-    async def _cmd_info(self, conv_id: str, home_conv_id: str) -> None:
-        if not self._proc_mgr:
-            await self._reply_conv(home_conv_id, "❌ 프로세스 모드가 비활성화 상태입니다.")
-            return
-        if not self._proc_mgr.has_process(conv_id):
-            await self._reply_conv(home_conv_id,
-                f"ℹ️ Conv #{conv_id}에 실행 중인 프로세스가 없습니다.")
-            return
-        procs = await self._proc_mgr.list_processes()
-        info  = next((p for p in procs if p["conv_id"] == conv_id), None)
-        if info:
-            from hermes_constants import get_hermes_home
-            log_path = get_hermes_home() / "logs" / f"conv_{conv_id}_api_server.log"
-            await self._reply_conv(home_conv_id,
-                f"**Conv #{conv_id} 프로세스 정보**\n"
-                f"• PID: {info['pid']}\n"
-                f"• Port: {info['port']}\n"
-                f"• Idle: {info['idle_seconds']}초\n"
-                f"• Log: `{log_path}`"
-            )
-
-    # ── 프로세스 응답 스트리밍 ────────────────────────────────────────────────
-
-    async def _handle_via_process(
-        self, conv_id: str, user_id: str, user_name: str, content: str
-    ) -> None:
-        accumulated: List[str] = []
-        try:
-            async for chunk in self._proc_mgr.stream_response(
-                conv_id=conv_id, text=content,
-                user_id=user_id, user_name=user_name,
-            ):
-                accumulated.append(chunk)
-                if self._sio and self._sio.connected:
-                    await self._sio.emit("message_chunk", {"text": chunk})
-        except Exception as e:
-            logger.error("Process stream error (conv=%s): %s", conv_id, e)
-            accumulated.append(f"\n\n[Error: {e}]")
-
-        if self._sio and self._sio.connected:
-            await self._sio.emit("message_done", {
-                "content": "".join(accumulated),
-                "type": "text",
-                "target_conversation_id": int(conv_id),
-            })
-
-    # ── 메시지 전송 헬퍼 ──────────────────────────────────────────────────────
-
-    async def _reply_conv(self, conv_id: str, text: str) -> None:
-        if self._sio and self._sio.connected:
-            await self._sio.emit("message_done", {
-                "content": text,
-                "type": "text",
-                "target_conversation_id": int(conv_id),
-            })
 
     # ── Outbound (표준) ───────────────────────────────────────────────────────
 
@@ -683,15 +443,3 @@ class SkyTowerAdapter(BasePlatformAdapter):
             print("=" * 40)
         except Exception as e:
             logger.warning("Failed to fetch pairing code: %s", e)
-
-
-# ---------------------------------------------------------------------------
-_HELP_TEXT = """**프로세스 관리 명령어** (홈 채널에서만 사용 가능)
-
-`/process start <conv_id>`   — 프로세스 생성 및 conversation 연결
-`/process stop  <conv_id>`   — 프로세스 종료
-`/process restart <conv_id>` — 프로세스 재시작
-`/process list`              — 실행 중인 프로세스 목록
-`/process info  <conv_id>`   — 프로세스 상세 정보
-
-홈 채널 설정: 아무 대화에서 `/sethome` 입력"""
