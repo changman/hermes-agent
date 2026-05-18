@@ -74,6 +74,59 @@ def _resolve(raw: str) -> Path:
     return Path(raw).expanduser().resolve()
 
 
+def _get_wiki_root() -> Path:
+    """Wiki 루트 디렉토리를 반환합니다.
+
+    WIKI_PATH 환경변수(llm-wiki 스킬 표준) → ~/wiki 순으로 폴백합니다.
+    """
+    val = os.getenv("WIKI_PATH", "").strip()
+    if val:
+        try:
+            p = Path(val).expanduser().resolve()
+            if p.exists() and p.is_dir():
+                return p
+        except Exception:
+            pass
+    return (Path.home() / "wiki").resolve()
+
+
+def _find_wiki_file(name: str) -> Optional[Path]:
+    """Wiki 루트에서 파일명(확장자 제외)으로 .md 파일을 찾습니다.
+
+    Shortest Path (A방식): 동일 이름 파일이 여러 개일 때 wiki 루트 기준
+    경로 depth가 가장 작은 파일(루트에 가장 가까운 파일)을 반환합니다.
+
+    Args:
+        name: 확장자를 제외한 파일명 (예: 'multimodal-memory-system')
+
+    Returns:
+        찾은 파일의 절대 경로, 없으면 None
+    """
+    wiki_root = _get_wiki_root()
+    if not wiki_root.exists():
+        logger.debug("_find_wiki_file: wiki root does not exist — %s", wiki_root)
+        return None
+
+    candidates: list[tuple[int, Path]] = []
+    for p in wiki_root.rglob("*.md"):
+        if p.stem == name:
+            try:
+                depth = len(p.relative_to(wiki_root).parts)
+                candidates.append((depth, p))
+            except ValueError:
+                pass
+
+    if not candidates:
+        logger.debug("_find_wiki_file: no match for %r in %s", name, wiki_root)
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    found = candidates[0][1]
+    logger.debug("_find_wiki_file: %r → %s (depth=%d, %d candidates)",
+                 name, found, candidates[0][0], len(candidates))
+    return found
+
+
 def _session_cwd(conv_id: Optional[str] = None) -> Path:
     """세션의 기본 작업 디렉토리를 반환합니다.
 
@@ -288,15 +341,29 @@ class FileAccessHandler:
     async def handle_read(self, data: dict) -> None:
         """
         data: { request_id: str, path: str }
+              | { request_id: str, type: 'filename', name: str }  — wiki Shortest Path 검색
         emit: file:read_result { request_id, path, content|base64_content, ... }
               | { request_id, error }
         """
         request_id = data.get("request_id", "")
         raw_path   = data.get("path", "")
-        logger.debug("file:read received — request_id=%s path=%s", request_id, raw_path)
+        logger.debug("file:read received — request_id=%s path=%s type=%s",
+                     request_id, raw_path, data.get("type"))
 
         async def _err(msg: str) -> None:
             await self._emit("file:read_result", {"request_id": request_id, "error": msg})
+
+        # 파일명 기반 Wiki 검색 (type='filename')
+        if data.get("type") == "filename":
+            name = (data.get("name") or "").strip()
+            if not name:
+                await _err("name is required for type=filename")
+                return
+            found = _find_wiki_file(name)
+            if found is None:
+                await _err(f"Wiki file not found: {name!r} (wiki root: {_get_wiki_root()})")
+                return
+            raw_path = str(found)
 
         if not raw_path:
             await _err("path is required")
