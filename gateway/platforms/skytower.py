@@ -90,6 +90,7 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._sio: Optional[Any] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._intentional_disconnect: bool = False
+        self._pending_thinking: Optional[str] = None  # 다음 send()에 포함할 reasoning
 
         # Per-user home channel: {user_id → conv_id}
         self._home_channels: Dict[str, str] = _load_home_channels()
@@ -356,6 +357,12 @@ class SkyTowerAdapter(BasePlatformAdapter):
             user_id = conversation_id = None
 
         payload: Dict[str, Any] = {"content": content, "type": "text"}
+        # _pending_thinking: gateway/run.py가 reasoning을 임시 저장, 여기서 소비
+        if self._pending_thinking:
+            payload["thinking"] = self._pending_thinking
+            self._pending_thinking = None
+        elif metadata and metadata.get("thinking"):
+            payload["thinking"] = metadata["thinking"]
         if conversation_id:
             payload["target_conversation_id"] = conversation_id
         elif user_id:
@@ -384,12 +391,30 @@ class SkyTowerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-    async def send_thinking_chunk(self, text: str) -> None:
-        if self._sio and self._sio.connected:
-            try:
-                await self._sio.emit("thinking_chunk", {"text": text})
-            except Exception:
-                pass
+    async def send_thinking_chunk(self, text: str, chat_id: Optional[str] = None) -> None:
+        if not self._sio or not self._sio.connected:
+            logger.warning("[REASONING_CONTEXT] send_thinking_chunk 실패: sio 미연결")
+            return
+        try:
+            payload: Dict[str, Any] = {"text": text}
+            if chat_id:
+                parts = chat_id.split(":")
+                try:
+                    user_id         = int(parts[2]) if len(parts) > 2 else None
+                    conversation_id = int(parts[3]) if len(parts) > 3 else None
+                except (ValueError, IndexError):
+                    user_id = conversation_id = None
+                if conversation_id:
+                    payload["target_conversation_id"] = conversation_id
+                elif user_id:
+                    payload["target_user_id"] = user_id
+            logger.warning(
+                "[REASONING_CONTEXT] thinking_chunk emit: %d자, payload_keys=%s",
+                len(text), list(payload.keys()),
+            )
+            await self._sio.emit("thinking_chunk", payload)
+        except Exception as e:
+            logger.warning("[REASONING_CONTEXT] thinking_chunk emit 실패: %s", e)
 
     async def send_notification(
         self, title: str, body: str = "", level: str = "info"
