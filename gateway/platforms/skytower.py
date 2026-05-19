@@ -53,6 +53,24 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._relay_url = extra.get("url") or os.getenv("SKYTOWER_URL", "")
         self._sio: Optional[Any] = None  # socketio.AsyncClient
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._intentional_disconnect: bool = False
+        self._pending_thinking: Optional[str] = None  # 다음 send()에 포함할 reasoning
+
+        # Per-user home channel: {user_id → conv_id}
+        self._home_channels: Dict[str, str] = _load_home_channels()
+
+        # File access handler — re-initialized in connect() with the live sio
+        self._file_handler: Optional[FileAccessHandler] = None
+
+    # ── Per-user home channel ─────────────────────────────────────────────────
+
+    def _get_user_home_conv(self, user_id: str) -> Optional[str]:
+        return self._home_channels.get(user_id)
+
+    def _set_user_home_conv(self, user_id: str, conv_id: str) -> None:
+        self._home_channels[user_id] = conv_id
+        _save_home_channels(self._home_channels)
+        logger.info("Home channel set: user=%s → conv=%s", user_id, conv_id)
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -169,6 +187,12 @@ class SkyTowerAdapter(BasePlatformAdapter):
             conversation_id = None
 
         payload: Dict[str, Any] = {"content": content, "type": "text"}
+        # _pending_thinking: gateway/run.py가 reasoning을 임시 저장, 여기서 소비
+        if self._pending_thinking:
+            payload["thinking"] = self._pending_thinking
+            self._pending_thinking = None
+        elif metadata and metadata.get("thinking"):
+            payload["thinking"] = metadata["thinking"]
         if conversation_id:
             payload["target_conversation_id"] = conversation_id
         elif user_id:
@@ -203,13 +227,30 @@ class SkyTowerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-    async def send_thinking_chunk(self, text: str) -> None:
-        """Stream a reasoning chunk to the web client (not saved to DB)."""
-        if self._sio and self._sio.connected:
-            try:
-                await self._sio.emit("thinking_chunk", {"text": text})
-            except Exception:
-                pass
+    async def send_thinking_chunk(self, text: str, chat_id: Optional[str] = None) -> None:
+        if not self._sio or not self._sio.connected:
+            logger.warning("[REASONING_CONTEXT] send_thinking_chunk 실패: sio 미연결")
+            return
+        try:
+            payload: Dict[str, Any] = {"text": text}
+            if chat_id:
+                parts = chat_id.split(":")
+                try:
+                    user_id         = int(parts[2]) if len(parts) > 2 else None
+                    conversation_id = int(parts[3]) if len(parts) > 3 else None
+                except (ValueError, IndexError):
+                    user_id = conversation_id = None
+                if conversation_id:
+                    payload["target_conversation_id"] = conversation_id
+                elif user_id:
+                    payload["target_user_id"] = user_id
+            logger.warning(
+                "[REASONING_CONTEXT] thinking_chunk emit: %d자, payload_keys=%s",
+                len(text), list(payload.keys()),
+            )
+            await self._sio.emit("thinking_chunk", payload)
+        except Exception as e:
+            logger.warning("[REASONING_CONTEXT] thinking_chunk emit 실패: %s", e)
 
     async def send_notification(
         self, title: str, body: str = "", level: str = "info"
