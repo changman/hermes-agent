@@ -9,6 +9,27 @@ Per-user Home Channel
 ---------------------
 각 유저가 /sethome 명령으로 자신의 홈 채널을 지정합니다.
 설정은 ~/.hermes/skytower_home_channels.json 에 유저별로 저장됩니다.
+
+Skill Bindings
+--------------
+config.yaml에서 채널(conversation_id)별로 스킬을 자동 바인딩할 수 있습니다.
+새 세션 시작 시 SKILL.md 전문이 자동으로 주입됩니다.
+
+예시 (config.yaml):
+  platforms:
+    skytower:
+      token: "agentId:rawToken"
+      url: "https://relay.example.com"
+      default_skill: "my-skill"          # 모든 대화의 기본 스킬
+      channel_skill_bindings:            # 대화방별 스킬 바인딩
+        - id: "42"                       # conversation_id
+          skill: "coding-assistant"
+        - id: "99"
+          skills: ["research", "writer"] # 복수 스킬
+      channel_prompts:                   # 대화방별 ephemeral 시스템 프롬프트
+        "42": "You are a senior backend engineer."
+      channel_names:                     # 대화방 표시명 (session context용)
+        "42": "코딩 채널"
 """
 
 import asyncio
@@ -259,11 +280,38 @@ class SkyTowerAdapter(BasePlatformAdapter):
                     "❌ `/sethome`은 대화방 안에서만 사용할 수 있습니다.")
             return
 
+        if content in ("/skills", "/skill-list"):
+            await self._handle_skills_command(user_str, conv_str)
+            return
+
         chat_id = (
             f"skytower:{self._agent_id}:{user_str}:{conv_str}"
             if conv_str
             else f"skytower:{self._agent_id}:{user_str}"
         )
+
+        # ── 채널별 스킬 바인딩 & 프롬프트 해석 ──────────────────────────────
+        from gateway.platforms.base import resolve_channel_skills, resolve_channel_prompt
+        extra = self.config.extra or {}
+
+        # conv_id를 채널 식별자로 사용 (없으면 user_id를 fallback)
+        _lookup_id  = conv_str or user_str
+        _parent_id  = user_str if conv_str else None
+
+        auto_skill = resolve_channel_skills(extra, _lookup_id, _parent_id)
+        if auto_skill is None:
+            # 전역 default_skill 적용
+            _default = (extra.get("default_skill") or "").strip()
+            if _default:
+                auto_skill = [_default]
+
+        channel_prompt = resolve_channel_prompt(extra, _lookup_id, _parent_id)
+
+        # 채널 표시명 (config.yaml channel_names 또는 user_name)
+        channel_names: dict = extra.get("channel_names") or {}
+        chat_topic: str | None = None
+        if conv_str:
+            chat_topic = channel_names.get(conv_str) or None
 
         source = self.build_source(
             chat_id=chat_id,
@@ -271,12 +319,15 @@ class SkyTowerAdapter(BasePlatformAdapter):
             chat_type="dm",
             user_id=user_str,
             user_name=user_name,
+            chat_topic=chat_topic,
         )
         await self.handle_message(MessageEvent(
             text=content,
             message_type=MessageType.TEXT,
             source=source,
             message_id=str(data.get("id", "")),
+            auto_skill=auto_skill,
+            channel_prompt=channel_prompt,
         ))
 
     # ── 메시지 전송 헬퍼 ──────────────────────────────────────────────────────
@@ -324,6 +375,35 @@ class SkyTowerAdapter(BasePlatformAdapter):
             else:
                 payload["target_user_id"] = int(user_id)
             await self._sio.emit("message_done", payload)
+
+    # ── /skills ───────────────────────────────────────────────────────────────
+
+    async def _handle_skills_command(self, user_id: str, conv_id: Optional[str]) -> None:
+        """사용 가능한 스킬 목록을 표시합니다."""
+        try:
+            from agent.skill_commands import scan_skill_commands
+            skill_cmds = scan_skill_commands()
+
+            if not skill_cmds:
+                text = "📦 설치된 스킬이 없습니다.\n`hermes skills install <skill-name>`으로 스킬을 설치하세요."
+            else:
+                lines = ["**🧩 사용 가능한 스킬 목록**\n"]
+                for cmd_key, info in sorted(skill_cmds.items()):
+                    name = info.get("name", cmd_key.lstrip("/"))
+                    desc = info.get("description", "")
+                    slug = cmd_key.lstrip("/")
+                    if desc:
+                        lines.append(f"• `/{slug}` — {desc}")
+                    else:
+                        lines.append(f"• `/{slug}`")
+                lines.append(f"\n총 **{len(skill_cmds)}개** 스킬 설치됨")
+                lines.append("스킬을 사용하려면 `/skill-name` 형식으로 입력하세요.")
+                text = "\n".join(lines)
+        except Exception as e:
+            logger.warning("Failed to list skills: %s", e)
+            text = "⚠️ 스킬 목록을 불러오는 중 오류가 발생했습니다."
+
+        await self._reply_user(user_id, conv_id, text)
 
     # ── /sethome ──────────────────────────────────────────────────────────────
 

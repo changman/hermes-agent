@@ -293,6 +293,232 @@ class TestGetChatInfo:
 
 
 # ---------------------------------------------------------------------------
+# Skill bindings (auto_skill, channel_prompts, channel_names)
+# ---------------------------------------------------------------------------
+
+class TestSkillBindings:
+    @pytest.mark.asyncio
+    async def test_auto_skill_from_channel_skill_bindings(self):
+        """conv_id가 channel_skill_bindings에 매핑되면 auto_skill이 설정된다."""
+        adapter = _make_adapter(
+            channel_skill_bindings=[
+                {"id": "3", "skill": "coding-assistant"},
+            ]
+        )
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "안녕",
+            "user_id": 7,
+            "conversation_id": 3,
+            "id": 1,
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert event.auto_skill == ["coding-assistant"]
+
+    @pytest.mark.asyncio
+    async def test_auto_skill_multiple_skills(self):
+        """channel_skill_bindings에 skills 리스트가 있으면 모두 설정된다."""
+        adapter = _make_adapter(
+            channel_skill_bindings=[
+                {"id": "10", "skills": ["research", "writer"]},
+            ]
+        )
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "hello",
+            "user_id": 1,
+            "conversation_id": 10,
+            "id": 2,
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert event.auto_skill == ["research", "writer"]
+
+    @pytest.mark.asyncio
+    async def test_default_skill_fallback(self):
+        """channel_skill_bindings에 해당 conv가 없으면 default_skill이 적용된다."""
+        adapter = _make_adapter(
+            default_skill="global-helper",
+            channel_skill_bindings=[
+                {"id": "99", "skill": "other"},
+            ]
+        )
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "hello",
+            "user_id": 5,
+            "conversation_id": 42,
+            "id": 3,
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert event.auto_skill == ["global-helper"]
+
+    @pytest.mark.asyncio
+    async def test_no_skill_when_no_binding_no_default(self):
+        """바인딩도 default_skill도 없으면 auto_skill은 None이다."""
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "hello",
+            "user_id": 5,
+            "conversation_id": 7,
+            "id": 4,
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert event.auto_skill is None
+
+    @pytest.mark.asyncio
+    async def test_channel_prompt_injected(self):
+        """channel_prompts에 매핑된 conv_id는 channel_prompt가 설정된다."""
+        adapter = _make_adapter(
+            channel_prompts={"5": "You are a senior engineer."}
+        )
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "hello",
+            "user_id": 1,
+            "conversation_id": 5,
+            "id": 5,
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert event.channel_prompt == "You are a senior engineer."
+
+    @pytest.mark.asyncio
+    async def test_channel_name_as_chat_topic(self):
+        """channel_names에 매핑된 conv_id는 source.chat_topic이 설정된다."""
+        adapter = _make_adapter(
+            channel_names={"3": "코딩 채널"}
+        )
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "hello",
+            "user_id": 7,
+            "conversation_id": 3,
+            "id": 6,
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert event.source.chat_topic == "코딩 채널"
+
+    @pytest.mark.asyncio
+    async def test_no_chat_topic_without_channel_names(self):
+        """channel_names 없이는 chat_topic이 None이다."""
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "hello",
+            "user_id": 7,
+            "conversation_id": 3,
+            "id": 7,
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert event.source.chat_topic is None
+
+    @pytest.mark.asyncio
+    async def test_channel_skill_binding_wins_over_default(self):
+        """binding이 있는 채널은 default_skill 대신 binding이 사용된다."""
+        adapter = _make_adapter(
+            default_skill="fallback-skill",
+            channel_skill_bindings=[
+                {"id": "77", "skill": "specific-skill"},
+            ]
+        )
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "hi",
+            "user_id": 1,
+            "conversation_id": 77,
+            "id": 8,
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert event.auto_skill == ["specific-skill"]
+
+
+# ---------------------------------------------------------------------------
+# /skills command
+# ---------------------------------------------------------------------------
+
+class TestSkillsCommand:
+    @pytest.mark.asyncio
+    async def test_skills_command_intercepted(self):
+        """/skills 명령은 handle_message를 거치지 않고 즉시 처리된다."""
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        adapter._handle_skills_command = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "/skills",
+            "user_id": 7,
+            "conversation_id": 3,
+            "id": 9,
+        })
+        adapter._handle_skills_command.assert_called_once_with("7", "3")
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skill_list_command_intercepted(self):
+        """/skill-list 도 동일하게 처리된다."""
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        adapter._handle_skills_command = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "/skill-list",
+            "user_id": 7,
+            "id": 10,
+        })
+        adapter._handle_skills_command.assert_called_once_with("7", None)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skills_command_sends_list(self):
+        """스킬이 있으면 목록을 응답한다."""
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+
+        fake_skills = {
+            "/my-skill": {"name": "my-skill", "description": "My test skill"},
+        }
+        with patch("agent.skill_commands.scan_skill_commands", return_value=fake_skills):
+            await adapter._handle_skills_command("7", "3")
+
+        adapter._sio.emit.assert_called_once()
+        payload = adapter._sio.emit.call_args[0][1]
+        assert "my-skill" in payload["content"]
+        assert "/my-skill" in payload["content"]
+
+    @pytest.mark.asyncio
+    async def test_skills_command_empty(self):
+        """스킬이 없으면 안내 메시지를 응답한다."""
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+
+        with patch("agent.skill_commands.scan_skill_commands", return_value={}):
+            await adapter._handle_skills_command("7", None)
+
+        payload = adapter._sio.emit.call_args[0][1]
+        assert "없습니다" in payload["content"]
+
+
+# ---------------------------------------------------------------------------
 # check_skytower_requirements
 # ---------------------------------------------------------------------------
 
