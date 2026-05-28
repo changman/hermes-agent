@@ -112,6 +112,9 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._intentional_disconnect: bool = False
         self._pending_thinking: Optional[str] = None  # 다음 send()에 포함할 reasoning
+        self._pending_usage: Optional[Dict[str, int]] = None  # 다음 send()에 포함할 turn token delta
+        self._prev_input_tokens: int = 0   # delta 계산용 직전 누적 input tokens
+        self._prev_output_tokens: int = 0  # delta 계산용 직전 누적 output tokens
 
         # Per-user home channel: {user_id → conv_id}
         self._home_channels: Dict[str, str] = _load_home_channels()
@@ -443,6 +446,10 @@ class SkyTowerAdapter(BasePlatformAdapter):
             self._pending_thinking = None
         elif metadata and metadata.get("thinking"):
             payload["thinking"] = metadata["thinking"]
+        # _pending_usage: gateway/run.py가 turn delta token 수를 임시 저장, 여기서 소비
+        if self._pending_usage:
+            payload["usage"] = self._pending_usage
+            self._pending_usage = None
         if conversation_id:
             payload["target_conversation_id"] = conversation_id
         elif user_id:
@@ -524,9 +531,10 @@ class SkyTowerAdapter(BasePlatformAdapter):
                 "cpu": psutil.cpu_percent(interval=None),
                 "mem": psutil.virtual_memory().percent,
                 "disk": psutil.disk_usage("/").percent,
+                "agent_type": "hermes",
             }
         except ImportError:
-            return {"cpu": 0.0, "mem": 0.0, "disk": 0.0}
+            return {"cpu": 0.0, "mem": 0.0, "disk": 0.0, "agent_type": "hermes"}
 
     # ── 온보딩 ────────────────────────────────────────────────────────────────
 

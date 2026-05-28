@@ -8927,6 +8927,18 @@ class GatewayRunner:
                         # 다른 플랫폼: 기존처럼 content에 prepend
                         response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
+            # Skytower: turn delta token usage를 어댑터에 임시 저장 → send()가 message_done에 포함
+            _usage_adapter = self.adapters.get(source.platform)
+            if _usage_adapter is not None and hasattr(_usage_adapter, "_pending_usage"):
+                _curr_input  = agent_result.get("input_tokens", 0) or 0
+                _curr_output = agent_result.get("output_tokens", 0) or 0
+                _usage_adapter._pending_usage = {
+                    "input_tokens":  _curr_input  - _usage_adapter._prev_input_tokens,
+                    "output_tokens": _curr_output - _usage_adapter._prev_output_tokens,
+                }
+                _usage_adapter._prev_input_tokens  = _curr_input
+                _usage_adapter._prev_output_tokens = _curr_output
+
             # Runtime-metadata footer — only on the FINAL message of the turn.
             # Off by default (display.runtime_footer.enabled=false).  When
             # streaming already delivered the body, we can't mutate the sent
