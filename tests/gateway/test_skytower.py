@@ -120,9 +120,10 @@ class TestHandleRelayMessage:
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_ignores_non_text_type(self):
+    async def test_ignores_non_text_type_without_file_content(self):
         adapter = _make_adapter()
         adapter.handle_message = AsyncMock()
+        # file_content 없는 image 타입은 무시됨
         await adapter._handle_relay_message({
             "direction": "outbound", "type": "image", "user_id": 7, "content": "ignored"
         })
@@ -516,6 +517,192 @@ class TestSkillsCommand:
 
         payload = adapter._sio.emit.call_args[0][1]
         assert "없습니다" in payload["content"]
+
+
+# ---------------------------------------------------------------------------
+# file_content 처리
+# ---------------------------------------------------------------------------
+
+class TestFileContent:
+    """file_content 필드를 포함한 메시지 처리 테스트."""
+
+    def _make_small_png(self) -> bytes:
+        """1x1 PNG 이미지 바이트를 반환합니다."""
+        import base64
+        return base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+            "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        )
+
+    # ── 이미지 처리 ────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_image_file_content_caches_and_sets_media(self):
+        """이미지 file_content가 캐시되어 media_urls에 추가되고 PHOTO 타입이 된다."""
+        import base64
+        from unittest.mock import patch as _patch
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+
+        img_bytes = self._make_small_png()
+        b64data = base64.b64encode(img_bytes).decode()
+
+        with _patch("gateway.platforms.skytower.cache_image_from_bytes", return_value="/cache/img_abc.png") as mock_cache:
+            await adapter._handle_relay_message({
+                "direction": "outbound",
+                "type": "image",
+                "content": "이 이미지를 설명해줘",
+                "user_id": 7,
+                "conversation_id": 3,
+                "id": 1,
+                "file_name": "photo.png",
+                "file_content": {
+                    "type": "image",
+                    "data": b64data,
+                    "mimeType": "image/png",
+                },
+            })
+
+        mock_cache.assert_called_once()
+        adapter.handle_message.assert_called_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type.value == "photo"
+        assert "/cache/img_abc.png" in event.media_urls
+        assert "image/png" in event.media_types
+        assert event.text == "이 이미지를 설명해줘"
+
+    @pytest.mark.asyncio
+    async def test_image_fallback_on_cache_error(self):
+        """이미지 캐싱 실패 시 오류 메시지가 텍스트에 추가된다."""
+        import base64
+        from unittest.mock import patch as _patch
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+
+        with _patch("gateway.platforms.skytower.cache_image_from_bytes", side_effect=ValueError("bad image")):
+            await adapter._handle_relay_message({
+                "direction": "outbound",
+                "type": "image",
+                "content": "caption",
+                "user_id": 7,
+                "id": 2,
+                "file_name": "bad.jpg",
+                "file_content": {
+                    "type": "image",
+                    "data": base64.b64encode(b"not-an-image").decode(),
+                    "mimeType": "image/jpeg",
+                },
+            })
+
+        adapter.handle_message.assert_called_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type.value == "text"
+        assert not event.media_urls
+        assert "처리 실패" in event.text
+
+    # ── 텍스트 파일 처리 ───────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_text_file_content_appended_to_prompt(self):
+        """텍스트 file_content가 프롬프트에 포함된다."""
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "이 파일 설명해줘",
+            "user_id": 7,
+            "id": 3,
+            "file_name": "config.json",
+            "file_content": {
+                "type": "text",
+                "data": '{"key": "value"}',
+            },
+        })
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type.value == "text"
+        assert "config.json" in event.text
+        assert '{"key": "value"}' in event.text
+        assert not event.media_urls
+
+    @pytest.mark.asyncio
+    async def test_text_file_content_truncated_flag(self):
+        """truncated=True 이면 안내 문구가 포함된다."""
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "",
+            "user_id": 7,
+            "id": 4,
+            "file_name": "large.txt",
+            "file_content": {
+                "type": "text",
+                "data": "partial content",
+                "truncated": True,
+            },
+        })
+
+        event = adapter.handle_message.call_args[0][0]
+        assert "처음 100KB만 표시" in event.text
+
+    # ── 기타 파일 처리 ──────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_binary_file_content_metadata_appended(self):
+        """타입이 'file'인 경우 메타데이터가 프롬프트에 추가된다."""
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "이 PDF에 대해 알려줘",
+            "user_id": 7,
+            "id": 5,
+            "file_name": "report.pdf",
+            "file_path": "~/documents/report.pdf",
+            "file_content": {
+                "type": "file",
+                "size": 2097152,
+                "mimeType": "application/pdf",
+            },
+        })
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type.value == "text"
+        assert "report.pdf" in event.text
+        assert "application/pdf" in event.text
+        assert "2048.0KB" in event.text
+        assert not event.media_urls
+
+    # ── 하위 호환성 ─────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_text_message_without_file_content_unchanged(self):
+        """file_content 없는 일반 text 메시지는 기존과 동일하게 처리된다."""
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_relay_message({
+            "direction": "outbound",
+            "type": "text",
+            "content": "안녕하세요",
+            "user_id": 7,
+            "conversation_id": 3,
+            "id": 6,
+        })
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text == "안녕하세요"
+        assert event.message_type.value == "text"
+        assert not event.media_urls
 
 
 # ---------------------------------------------------------------------------

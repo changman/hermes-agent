@@ -33,11 +33,12 @@ config.yaml에서 채널(conversation_id)별로 스킬을 자동 바인딩할 �
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -45,6 +46,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_image_from_bytes,
 )
 from gateway.platforms.skytower_files import FileAccessHandler
 
@@ -257,8 +259,13 @@ class SkyTowerAdapter(BasePlatformAdapter):
         if data.get("direction") != "outbound":
             logger.warning("on_message dropped: direction=%r (expected 'outbound')", data.get("direction"))
             return
-        if data.get("type") != "text":
-            logger.warning("on_message dropped: type=%r (expected 'text')", data.get("type"))
+
+        msg_type = data.get("type", "text")
+        file_content = data.get("file_content")
+
+        # text 타입이거나, file_content가 있는 경우만 처리
+        if msg_type != "text" and not file_content:
+            logger.warning("on_message dropped: type=%r with no file_content", msg_type)
             return
 
         user_id = data.get("user_id")
@@ -286,6 +293,16 @@ class SkyTowerAdapter(BasePlatformAdapter):
         if content in ("/skills", "/skill-list"):
             await self._handle_skills_command(user_str, conv_str)
             return
+
+        # ── file_content 처리 ─────────────────────────────────────────────────
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        message_type = MessageType.TEXT
+
+        if file_content:
+            content, media_urls, media_types, message_type = self._process_file_content(
+                content, file_content, data
+            )
 
         chat_id = (
             f"skytower:{self._agent_id}:{user_str}:{conv_str}"
@@ -326,12 +343,71 @@ class SkyTowerAdapter(BasePlatformAdapter):
         )
         await self.handle_message(MessageEvent(
             text=content,
-            message_type=MessageType.TEXT,
+            message_type=message_type,
             source=source,
             message_id=str(data.get("id", "")),
             auto_skill=auto_skill,
             channel_prompt=channel_prompt,
+            media_urls=media_urls,
+            media_types=media_types,
         ))
+
+    def _process_file_content(
+        self,
+        content: str,
+        file_content: Dict[str, Any],
+        data: Dict[str, Any],
+    ) -> tuple:
+        """file_content 필드를 처리하여 (content, media_urls, media_types, message_type)을 반환합니다."""
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        message_type = MessageType.TEXT
+        fc_type = file_content.get("type")
+
+        if fc_type == "image":
+            mime = file_content.get("mimeType", "image/jpeg")
+            raw_subtype = mime.split("/")[-1].lower() if "/" in mime else "jpeg"
+            _ext_map = {"jpeg": ".jpg", "jpg": ".jpg", "png": ".png",
+                        "gif": ".gif", "webp": ".webp", "bmp": ".bmp"}
+            ext = _ext_map.get(raw_subtype, f".{raw_subtype}")
+            try:
+                raw_bytes = base64.b64decode(file_content["data"])
+                cached_path = cache_image_from_bytes(raw_bytes, ext)
+                media_urls.append(cached_path)
+                media_types.append(mime)
+                message_type = MessageType.PHOTO
+                logger.info("file_content image cached: %s (%d bytes)", cached_path, len(raw_bytes))
+            except Exception as e:
+                logger.warning("Failed to cache file_content image: %s", e)
+                file_name = data.get("file_name", "image")
+                content = (content + f"\n\n[첨부 이미지: {file_name} — 처리 실패: {e}]").strip()
+
+        elif fc_type == "text":
+            text_data = file_content.get("data", "")
+            file_name = data.get("file_name", "unnamed")
+            truncated = file_content.get("truncated", False)
+            truncation_note = " (처음 100KB만 표시)" if truncated else ""
+            content = (
+                content
+                + f"\n\n[첨부 파일: {file_name}{truncation_note}]\n```\n{text_data}\n```"
+            ).strip()
+
+        elif fc_type == "file":
+            size_bytes = file_content.get("size", 0)
+            mime = file_content.get("mimeType", "unknown")
+            file_name = data.get("file_name", "N/A")
+            file_path = data.get("file_path", "N/A")
+            size_kb = size_bytes / 1024
+            content = (
+                content
+                + f"\n\n[첨부 파일]\n- 이름: {file_name}\n- 타입: {mime}"
+                f"\n- 크기: {size_kb:.1f}KB\n- 경로: {file_path}"
+            ).strip()
+
+        else:
+            logger.warning("Unknown file_content type: %r", fc_type)
+
+        return content, media_urls, media_types, message_type
 
     # ── 메시지 전송 헬퍼 ──────────────────────────────────────────────────────
 
