@@ -131,40 +131,50 @@ export const SlashPopover = forwardRef<SlashPopoverHandle, Props>(
 
     if (!visible) return null;
 
+    const selectedMeta = items[selected]?.meta;
+
     return (
       <div
-        className="absolute bottom-full left-0 right-0 mb-2 max-h-64 overflow-y-auto rounded-md border border-border bg-popover shadow-xl text-sm"
+        className="absolute bottom-full left-0 right-0 mb-2 rounded-md border border-border bg-popover shadow-xl text-sm"
         role="listbox"
       >
-        {items.map((it, i) => {
-          const active = i === selected;
+        <div className="max-h-52 overflow-y-auto">
+          {items.map((it, i) => {
+            const active = i === selected;
 
-          return (
-            <ListItem
-              key={`${it.text}-${i}`}
-              active={active}
-              role="option"
-              aria-selected={active}
-              onMouseEnter={() => setSelected(i)}
-              onClick={() => apply(it)}
-              className="px-3 py-1.5"
-            >
-              <ChevronRight
-                className={`h-3 w-3 shrink-0 ${active ? "text-primary" : "text-transparent"}`}
-              />
+            return (
+              <ListItem
+                key={`${it.text}-${i}`}
+                active={active}
+                role="option"
+                aria-selected={active}
+                onMouseEnter={() => setSelected(i)}
+                onClick={() => apply(it)}
+                className="px-3 py-1.5"
+              >
+                <ChevronRight
+                  className={`h-3 w-3 shrink-0 ${active ? "text-primary" : "text-transparent"}`}
+                />
 
-              <span className="font-mono text-xs shrink-0 truncate">
-                {it.display}
-              </span>
-
-              {it.meta && (
-                <span className="text-xs text-text-tertiary truncate ml-auto">
-                  {it.meta}
+                <span className="font-mono text-xs shrink-0 truncate">
+                  {it.display}
                 </span>
-              )}
-            </ListItem>
-          );
-        })}
+
+                {it.meta && (
+                  <span className="text-xs text-text-tertiary truncate ml-auto">
+                    {it.meta}
+                  </span>
+                )}
+              </ListItem>
+            );
+          })}
+        </div>
+
+        {selectedMeta && (
+          <div className="border-t border-border/50 px-3 py-2 text-xs text-text-secondary leading-relaxed bg-muted/10">
+            {selectedMeta}
+          </div>
+        )}
       </div>
     );
   },

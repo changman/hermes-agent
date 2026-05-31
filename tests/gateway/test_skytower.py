@@ -520,6 +520,73 @@ class TestSkillsCommand:
 
 
 # ---------------------------------------------------------------------------
+# request:agent-skills 이벤트
+# ---------------------------------------------------------------------------
+
+class TestAgentSkillsRequest:
+    @pytest.mark.asyncio
+    async def test_responds_with_skills(self):
+        """request:agent-skills 수신 시 agent:skills-response를 응답한다."""
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+
+        fake_skills = {
+            "/analyze": {"name": "analyze", "description": "코드 분석"},
+            "/refactor": {"name": "refactor", "description": "코드 리팩토링"},
+        }
+        with patch("agent.skill_commands.scan_skill_commands", return_value=fake_skills):
+            await adapter._handle_agent_skills_request({"requestId": "req-abc"})
+
+        adapter._sio.emit.assert_called_once()
+        event, payload = adapter._sio.emit.call_args[0]
+        assert event == "agent:skills-response"
+        assert payload["requestId"] == "req-abc"
+        assert any(s["command"] == "/analyze" for s in payload["skills"])
+        assert any(s["command"] == "/refactor" for s in payload["skills"])
+        assert payload["metadata"]["agentType"] == "hermes"
+
+    @pytest.mark.asyncio
+    async def test_responds_with_empty_skills(self):
+        """스킬이 없으면 빈 배열로 응답한다."""
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+
+        with patch("agent.skill_commands.scan_skill_commands", return_value={}):
+            await adapter._handle_agent_skills_request({"requestId": "req-xyz"})
+
+        event, payload = adapter._sio.emit.call_args[0]
+        assert event == "agent:skills-response"
+        assert payload["skills"] == []
+        assert payload["requestId"] == "req-xyz"
+
+    @pytest.mark.asyncio
+    async def test_not_connected_does_nothing(self):
+        """연결되지 않은 경우 아무것도 전송하지 않는다."""
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = False
+
+        await adapter._handle_agent_skills_request({"requestId": "req-1"})
+        adapter._sio.emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_scan_error_responds_with_empty_skills(self):
+        """scan_skill_commands 실패 시 빈 배열로 응답한다."""
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+
+        with patch("agent.skill_commands.scan_skill_commands", side_effect=RuntimeError("오류")):
+            await adapter._handle_agent_skills_request({"requestId": "req-err"})
+
+        event, payload = adapter._sio.emit.call_args[0]
+        assert event == "agent:skills-response"
+        assert payload["skills"] == []
+
+
+# ---------------------------------------------------------------------------
 # file_content 처리
 # ---------------------------------------------------------------------------
 

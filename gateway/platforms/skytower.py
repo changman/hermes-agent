@@ -227,6 +227,12 @@ class SkyTowerAdapter(BasePlatformAdapter):
             except Exception:
                 logger.exception("file:delete handler error — data=%s", data)
 
+        # ── 스킬 조회 이벤트 ──────────────────────────────────────────────────
+
+        @self._sio.on("request:agent-skills")
+        async def on_request_agent_skills(data: dict):
+            await self._handle_agent_skills_request(data)
+
         try:
             await self._sio.connect(
                 self._relay_url,
@@ -495,6 +501,34 @@ class SkyTowerAdapter(BasePlatformAdapter):
             msg += f"\n이전 홈 채널: Conv #{prev}"
 
         await self._reply_conv(conv_id, msg)
+
+    # ── request:agent-skills ─────────────────────────────────────────────────
+
+    async def _handle_agent_skills_request(self, data: dict) -> None:
+        """Skytower Server의 스킬 조회 요청에 응답합니다."""
+        if not self._sio or not self._sio.connected:
+            return
+        request_id = data.get("requestId", "")
+        logger.info("[skills] Responding to skills request: %s", request_id)
+        try:
+            from agent.skill_commands import scan_skill_commands
+            skill_cmds = scan_skill_commands()
+            skills = [
+                {"command": cmd, "description": info.get("description", "")}
+                for cmd, info in sorted(skill_cmds.items())
+            ]
+        except Exception as e:
+            logger.warning("[skills] Failed to scan skill commands: %s", e)
+            skills = []
+        await self._sio.emit("agent:skills-response", {
+            "requestId": request_id,
+            "skills": skills,
+            "metadata": {
+                "agentType": "hermes",
+                "agentName": "Hermes Agent",
+                "version": "1.0.0",
+            },
+        })
 
     # ── Outbound (표준) ───────────────────────────────────────────────────────
 
