@@ -146,11 +146,13 @@ function Install-PluginFiles {
     $targetDir = "$InstallDir\plugins\platforms\skytower"
     New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
 
-    # 이 스크립트가 이미 저장소 안에 있는지 확인 (로컬 개발 모드)
+    # 이 스크립트가 저장소 안에 있는지 확인 (로컬 개발 모드)
+    # iex (irm ...) 방식 실행 시 $ScriptDir = $PWD 이므로 실제 파일 존재 여부로 판단
     $localPluginDir = Join-Path $ScriptDir "..\plugins\platforms\skytower"
     $localFilesDir  = Join-Path $ScriptDir "..\gateway\platforms"
+    $localPluginDir = [System.IO.Path]::GetFullPath($localPluginDir)
 
-    if (Test-Path "$localPluginDir\adapter.py") {
+    if ((Test-Path "$localPluginDir\adapter.py") -and (Test-Path "$localPluginDir\..\..\..\gateway")) {
         Write-Info "로컬 소스에서 플러그인 파일 복사 중..."
         Copy-Item "$localPluginDir\*" -Destination $targetDir -Recurse -Force
 
@@ -342,8 +344,12 @@ $InstallDir   = Find-HermesInstall
 $HermesHomeResolved = Resolve-HermesHome -InstallDir $InstallDir
 $PythonExe    = Find-Python   -InstallDir $InstallDir
 $UvExe        = Find-Uv       -InstallDir $InstallDir
-$ScriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (-not $ScriptDir) { $ScriptDir = $PWD.Path }
+# iex (irm ...) 방식으로 실행하면 MyCommand.Path가 $null — 미리 guard
+$ScriptDir = if ($MyInvocation.MyCommand.Path) {
+    Split-Path -Parent $MyInvocation.MyCommand.Path
+} else {
+    $PWD.Path
+}
 
 Install-PluginFiles -InstallDir $InstallDir -ScriptDir $ScriptDir
 Install-Deps        -InstallDir $InstallDir -PythonExe $PythonExe -UvExe $UvExe
