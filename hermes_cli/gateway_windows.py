@@ -112,6 +112,10 @@ def _exec_schtasks(args: list[str]) -> tuple[int, str, str]:
             [schtasks, *args],
             capture_output=True,
             text=True,
+            # schtasks.exe는 시스템 코드페이지(한국어 Windows: CP949)로 출력하므로
+            # PYTHONIOENCODING=utf-8 환경에서도 깨지지 않도록 errors='replace' 지정.
+            encoding="utf-8",
+            errors="replace",
             timeout=_SCHTASKS_TIMEOUT_S,
             # CREATE_NO_WINDOW avoids a flashing console window when the CLI
             # is itself hosted in a TUI. See tools/browser_tool.py for the
