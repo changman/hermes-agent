@@ -53,10 +53,6 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.platforms.skytower_files import FileAccessHandler
-try:
-    from .soul_sync import SoulSync  # 플러그인 패키지로 로드될 때 (프로덕션)
-except ImportError:
-    from gateway.soul_sync import SoulSync  # standalone 로드 시 fallback (테스트)
 
 logger = logging.getLogger(__name__)
 
@@ -86,26 +82,6 @@ def _save_home_channels(mapping: Dict[str, str]) -> None:
         )
     except OSError as e:
         logger.warning("Failed to save home channels: %s", e)
-
-
-def _disable_pair_code_in_env() -> None:
-    """서비스 모드 감지 시 .env의 SKYTOWER_PRINT_PAIR_CODE를 0으로 설정."""
-    try:
-        from hermes_constants import get_hermes_home
-        env_path = get_hermes_home() / ".env"
-        if not env_path.exists():
-            return
-        text = env_path.read_text(encoding="utf-8")
-        import re
-        if re.search(r"(?m)^SKYTOWER_PRINT_PAIR_CODE=", text):
-            new_text = re.sub(r"(?m)^SKYTOWER_PRINT_PAIR_CODE=.*", "SKYTOWER_PRINT_PAIR_CODE=0", text)
-        else:
-            new_text = text.rstrip("\n") + "\nSKYTOWER_PRINT_PAIR_CODE=0\n"
-        if new_text != text:
-            env_path.write_text(new_text, encoding="utf-8")
-            logger.info("서비스 모드 감지 — SKYTOWER_PRINT_PAIR_CODE=0 으로 저장됨")
-    except Exception as e:
-        logger.warning("Failed to update .env SKYTOWER_PRINT_PAIR_CODE: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -156,18 +132,13 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._sio: Optional[Any] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._intentional_disconnect: bool = False
+        self._pending_thinking: Optional[str] = None
+        self._pending_usage: Optional[Dict[str, int]] = None
+        self._prev_input_tokens: int = 0
+        self._prev_output_tokens: int = 0
 
         self._home_channels: Dict[str, str] = _load_home_channels()
         self._file_handler: Optional[FileAccessHandler] = None
-
-        # Soul sync: SkyTower → SOUL.md
-        _allow_overwrite = os.getenv("SOUL_ALLOW_OVERWRITE", "").lower() in ("1", "true", "yes")
-        self._soul_sync = SoulSync(
-            agent_id=self._agent_id,
-            token=self._token,
-            relay_url=self._relay_url,
-            allow_overwrite=_allow_overwrite,
-        )
 
     # ── Per-user home channel ─────────────────────────────────────────────────
 
@@ -205,20 +176,8 @@ class SkyTowerAdapter(BasePlatformAdapter):
             await self._sio.emit("heartbeat", self._collect_metrics())
             if self._heartbeat_task is None or self._heartbeat_task.done():
                 self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            _print_pair = os.getenv("SKYTOWER_PRINT_PAIR_CODE", "1").lower() in ("1", "true", "yes")
-            _is_service = os.getenv("HERMES_GATEWAY_DETACHED", "") == "1"
-            if not _is_service:
-                try:
-                    import sys
-                    _is_service = not sys.stdout.isatty()
-                except Exception:
-                    pass
-            if _is_service:
-                if _print_pair:
-                    _disable_pair_code_in_env()
-            else:
-                if _print_pair:
-                    await self._print_pairing_code()
+            if os.getenv("SKYTOWER_PRINT_PAIR_CODE", "").lower() in ("1", "true", "yes"):
+                await self._print_pairing_code()
 
         @self._sio.event
         async def disconnect():
@@ -290,20 +249,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
         async def on_request_agent_skills(data: dict):
             await self._handle_agent_skills_request(data)
 
-        @self._sio.on("refresh:agent-commands")
-        async def on_refresh_agent_commands(data: dict):
-            await self._handle_refresh_commands(data)
-
-        # ── Soul Sync: SkyTower → SOUL.md ────────────────────────────────────
-
-        @self._sio.on("agent:sync-requested")
-        async def on_sync_requested(data: dict):
-            await self._handle_soul_sync_request(data)
-
-        @self._sio.on("soul:persona-updated")
-        async def on_persona_updated(data: dict):
-            await self._handle_soul_persona_updated(data)
-
         try:
             await self._sio.connect(
                 self._relay_url,
@@ -368,10 +313,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
 
         if content in ("/skills", "/skill-list"):
             await self._handle_skills_command(user_str, conv_str)
-            return
-
-        if content == "/paircode":
-            await self._handle_paircode(user_str, conv_str)
             return
 
         # ── file_content 처리 ─────────────────────────────────────────────────
@@ -589,62 +530,15 @@ class SkyTowerAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[skills] Failed to scan skill commands: %s", e)
             skills = []
-        try:
-            from gateway.commands_parser import get_hermes_commands
-            commands = get_hermes_commands()
-        except Exception as e:
-            logger.warning("[skills] Failed to build commands: %s", e)
-            commands = {}
-        total_commands = sum(len(v) for v in commands.values()) if commands else 0
-        logger.info(
-            "[skills] skills=%d commands=%d categories=%d",
-            len(skills), total_commands, len(commands),
-        )
         await self._sio.emit("agent:skills-response", {
             "requestId": request_id,
             "skills": skills,
-            "commands": commands,
             "metadata": {
                 "agentType": "hermes",
                 "agentName": "Hermes Agent",
                 "version": "1.0.0",
             },
         })
-
-    async def _handle_refresh_commands(self, data: dict) -> None:
-        """refresh:agent-commands 이벤트 처리. commands 캐시를 무효화합니다."""
-        if not self._sio or not self._sio.connected:
-            return
-        request_id = data.get("requestId", "")
-        try:
-            from gateway.commands_parser import invalidate_commands_cache
-            invalidate_commands_cache()
-        except Exception as e:
-            logger.warning("[skills] Failed to invalidate commands cache: %s", e)
-        await self._sio.emit("refresh:agent-commands-response", {
-            "requestId": request_id,
-            "status": "ok",
-        })
-
-    # ── Soul Sync ─────────────────────────────────────────────────────────────
-
-    async def _handle_soul_sync_request(self, data: dict) -> None:
-        """agent:sync-requested 이벤트 처리. SkyTower로부터 전체 persona 동기화 요청."""
-        logger.info("[SOUL] Received agent:sync-requested event")
-        result = await self._soul_sync.sync_personas()
-        if self._sio and self._sio.connected:
-            try:
-                await self._sio.emit("agent:sync-result", result)
-            except Exception as e:
-                logger.warning("[SOUL] Failed to emit agent:sync-result: %s", e)
-
-    async def _handle_soul_persona_updated(self, data: dict) -> None:
-        """soul:persona-updated 이벤트 처리. 특정 사용자의 persona 즉시 업데이트."""
-        user_id = data.get("userId", "unknown")
-        persona = data.get("persona", "")
-        logger.info("[SOUL] Received soul:persona-updated event (userId: %s)", user_id)
-        if persona:
-            await self._soul_sync.update_soul_file(user_id, persona)
 
     # ── Outbound (표준) ───────────────────────────────────────────────────────
 
@@ -666,6 +560,14 @@ class SkyTowerAdapter(BasePlatformAdapter):
             user_id = conversation_id = None
 
         payload: Dict[str, Any] = {"content": content, "type": "text"}
+        if self._pending_thinking:
+            payload["thinking"] = self._pending_thinking
+            self._pending_thinking = None
+        elif metadata and metadata.get("thinking"):
+            payload["thinking"] = metadata["thinking"]
+        if self._pending_usage:
+            payload["usage"] = self._pending_usage
+            self._pending_usage = None
         if conversation_id:
             payload["target_conversation_id"] = conversation_id
         elif user_id:
@@ -695,12 +597,8 @@ class SkyTowerAdapter(BasePlatformAdapter):
                 pass
 
     async def send_thinking_chunk(self, text: str, chat_id: Optional[str] = None) -> None:
-        """실시간 reasoning 스트리밍 — gateway hook이 있을 때 호출됨 (Option B).
-
-        현재(Option C)는 gateway/run.py에 hook이 없으므로 호출되지 않는다.
-        향후 upstream PR이 merge되면 gateway가 이 메서드를 직접 호출한다.
-        """
         if not self._sio or not self._sio.connected:
+            logger.warning("[REASONING_CONTEXT] send_thinking_chunk 실패: sio 미연결")
             return
         try:
             payload: Dict[str, Any] = {"text": text}
@@ -715,9 +613,13 @@ class SkyTowerAdapter(BasePlatformAdapter):
                     payload["target_conversation_id"] = conversation_id
                 elif user_id:
                     payload["target_user_id"] = user_id
+            logger.warning(
+                "[REASONING_CONTEXT] thinking_chunk emit: %d자, payload_keys=%s",
+                len(text), list(payload.keys()),
+            )
             await self._sio.emit("thinking_chunk", payload)
         except Exception as e:
-            logger.debug("thinking_chunk emit failed: %s", e)
+            logger.warning("[REASONING_CONTEXT] thinking_chunk emit 실패: %s", e)
 
     async def send_notification(
         self, title: str, body: str = "", level: str = "info"
@@ -751,34 +653,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
             }
         except ImportError:
             return {"cpu": 0.0, "mem": 0.0, "disk": 0.0, "agent_type": "hermes"}
-
-    # ── /paircode ─────────────────────────────────────────────────────────────
-
-    async def _handle_paircode(self, user_id: str, conv_id: Optional[str]) -> None:
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
-                    f"{self._relay_url}/api/agents/pairing-code",
-                    headers={"Authorization": f"Bearer {self._token}"},
-                    json={"expiresMinutes": 10, "maxUses": 1},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            code = data.get("code", "N/A")
-            pair_url = data.get("pairUrl", "")
-            text = (
-                f"**친구 추가 코드**\n"
-                f"`{code}`\n\n"
-                f"• 유효시간: 10분 / 1회 사용\n"
-            )
-            if pair_url:
-                text += f"• URL: {pair_url}"
-        except Exception as e:
-            logger.warning("Failed to fetch pairing code: %s", e)
-            text = f"❌ 페어링 코드 발급 실패: {e}"
-
-        await self._reply_user(user_id, conv_id, text)
 
     # ── 온보딩 ────────────────────────────────────────────────────────────────
 

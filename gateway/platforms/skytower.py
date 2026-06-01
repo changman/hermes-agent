@@ -1,4 +1,7 @@
-"""Skytower Relay platform adapter.
+"""Skytower Relay platform adapter — legacy shim.
+
+이 파일은 이전 버전 호환용입니다.
+실제 구현은 plugins/platforms/skytower/adapter.py 로 이동했습니다.
 
 Connects Hermes to the Skytower Relay Server via Socket.IO.
 The relay acts as a gateway between web browser users and Hermes AI.

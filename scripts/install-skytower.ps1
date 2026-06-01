@@ -10,19 +10,18 @@
 # 2단계 - Skytower 채널 추가:
 #   iex (irm https://raw.githubusercontent.com/changman/hermes-agent/skytower/scripts/install-skytower.ps1)
 #
-# 또는 토큰을 미리 지정:
+# 또는 토큰/URL을 미리 지정:
 #   $env:SKYTOWER_TOKEN = "agentId:rawToken"
+#   $env:SKYTOWER_URL   = "https://relay.example.com"
 #   iex (irm https://raw.githubusercontent.com/changman/hermes-agent/skytower/scripts/install-skytower.ps1)
 #
 # ============================================================================
 
 param(
-    [string]$Token      = $env:SKYTOWER_TOKEN,
-    [string]$Url        = $env:SKYTOWER_URL,
+    [string]$Token     = $env:SKYTOWER_TOKEN,
+    [string]$Url       = $env:SKYTOWER_URL,
     [string]$HermesHome = ""
 )
-
-if (-not $Url) { $Url = "https://skytower-api.codescape.biz" }
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference    = "SilentlyContinue"
@@ -147,29 +146,17 @@ function Install-PluginFiles {
     $targetDir = "$InstallDir\plugins\platforms\skytower"
     New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
 
-    # 이 스크립트가 저장소 안에 있는지 확인 (로컬 개발 모드)
-    # iex (irm ...) 방식 실행 시 $ScriptDir = $PWD 이므로 실제 파일 존재 여부로 판단
+    # 이 스크립트가 이미 저장소 안에 있는지 확인 (로컬 개발 모드)
     $localPluginDir = Join-Path $ScriptDir "..\plugins\platforms\skytower"
     $localFilesDir  = Join-Path $ScriptDir "..\gateway\platforms"
-    $localPluginDir = [System.IO.Path]::GetFullPath($localPluginDir)
 
-    if ((Test-Path "$localPluginDir\adapter.py") -and (Test-Path "$localPluginDir\..\..\..\gateway")) {
+    if (Test-Path "$localPluginDir\adapter.py") {
         Write-Info "로컬 소스에서 플러그인 파일 복사 중..."
         Copy-Item "$localPluginDir\*" -Destination $targetDir -Recurse -Force
 
         $localFilesPy = "$localFilesDir\skytower_files.py"
         if (Test-Path $localFilesPy) {
             Copy-Item $localFilesPy "$InstallDir\gateway\platforms\skytower_files.py" -Force
-        }
-
-        # Windows CP949 인코딩 버그 수정 파일
-        $localGatewayWindows = [System.IO.Path]::GetFullPath("$ScriptDir\..\hermes_cli\gateway_windows.py")
-        $localStatusPy       = [System.IO.Path]::GetFullPath("$ScriptDir\..\gateway\status.py")
-        if (Test-Path $localGatewayWindows) {
-            Copy-Item $localGatewayWindows "$InstallDir\hermes_cli\gateway_windows.py" -Force
-        }
-        if (Test-Path $localStatusPy) {
-            Copy-Item $localStatusPy "$InstallDir\gateway\status.py" -Force
         }
         Write-Success "플러그인 파일 복사 완료"
     } else {
@@ -180,12 +167,8 @@ function Install-PluginFiles {
         $files = @(
             "plugins/platforms/skytower/__init__.py",
             "plugins/platforms/skytower/adapter.py",
-            "plugins/platforms/skytower/soul_sync.py",
             "plugins/platforms/skytower/plugin.yaml",
-            "gateway/platforms/skytower_files.py",
-            "gateway/commands_parser.py",
-            "hermes_cli/gateway_windows.py",
-            "gateway/status.py"
+            "gateway/platforms/skytower_files.py"
         )
 
         foreach ($file in $files) {
@@ -233,99 +216,56 @@ function Install-Deps {
 }
 
 # ============================================================================
-# 에이전트 자동 등록
-# ============================================================================
-
-function Register-SkytowerAgent {
-    param([string]$RelayUrl, [string]$AgentName)
-
-    Write-Info "Skytower 서버에 에이전트 등록 중: $AgentName"
-    $body = "{`"name`": `"$AgentName`"}"
-    try {
-        $resp = Invoke-RestMethod -Uri "$RelayUrl/api/agents/register" `
-            -Method POST `
-            -ContentType "application/json" `
-            -Body $body `
-            -ErrorAction Stop
-        $token = $resp.token
-        if (-not $token) { throw "응답에 token 필드가 없습니다" }
-        Write-Success "에이전트 등록 완료: $($resp.agentId)"
-        Write-Host ""
-        Write-Host "  [!] 토큰은 재발급 불가 — 안전한 곳에 보관하세요:" -ForegroundColor Yellow
-        Write-Host "      $token" -ForegroundColor White
-        Write-Host ""
-        return $token
-    } catch {
-        Write-Warn "자동 등록 실패: $_"
-        return $null
-    }
-}
-
-# ============================================================================
-# 토큰 획득 (자동 등록 또는 수동 입력)
-# ============================================================================
-
-function Get-SkytowerToken {
-    param([string]$RelayUrl, [string]$ExistingToken)
-
-    if ($ExistingToken) { return $ExistingToken }
-
-    Write-Host ""
-    Write-Host "  Skytower 에이전트 토큰이 없습니다." -ForegroundColor Yellow
-    Write-Host "  Skytower 서버에 새 에이전트를 자동 등록할 수 있습니다." -ForegroundColor Yellow
-    Write-Host ""
-    $doRegister = Read-Host "자동 등록하시겠습니까? (Y/n)"
-    if ($doRegister -ne "n" -and $doRegister -ne "N") {
-        $defaultName = "My Hermes Agent"
-        $agentName = Read-Host "에이전트 이름 (기본값: $defaultName)"
-        if (-not $agentName) { $agentName = $defaultName }
-        $registered = Register-SkytowerAgent -RelayUrl $RelayUrl -AgentName $agentName
-        if ($registered) { return $registered }
-    }
-
-    return (Read-Host "`nSkytower 에이전트 토큰 입력 (agentId:rawToken, 없으면 Enter)").Trim()
-}
-
-# ============================================================================
 # .env 설정
 # ============================================================================
 
-function Set-EnvLine {
-    param([string]$FileContent, [string]$Key, [string]$Value)
-    if ($FileContent -match "(?m)^${Key}=.*") {
-        return $FileContent -replace "(?m)^${Key}=.*", "${Key}=${Value}"
-    } else {
-        return $FileContent + "`n${Key}=${Value}"
-    }
-}
-
 function Configure-Env {
-    param([string]$HermesHomeDir, [string]$Token, [string]$Url)
+    param([string]$HermesHomeDir)
 
     $envFile = "$HermesHomeDir\.env"
-    if (-not (Test-Path $envFile)) { New-Item -ItemType Directory -Force -Path $HermesHomeDir | Out-Null; New-Item -ItemType File -Force -Path $envFile | Out-Null }
+    if (-not (Test-Path $envFile)) { New-Item -ItemType File -Force -Path $envFile | Out-Null }
 
-    [string]$envContent = (Get-Content $envFile -Raw -ErrorAction SilentlyContinue)
-    if (-not $envContent) { $envContent = "" }
+    # 인터랙티브 입력
+    if (-not $Token) {
+        $Token = Read-Host "`nSkytower 에이전트 토큰 입력 (agentId:rawToken, 없으면 Enter)"
+        $Token = $Token.Trim()
+    }
+    if (-not $Url) {
+        $Url = Read-Host "Skytower Relay URL 입력 (예: https://relay.example.com, 없으면 Enter)"
+        $Url = $Url.Trim()
+    }
+
+    $content = Get-Content $envFile -Raw -ErrorAction SilentlyContinue
+    if (-not $content) { $content = "" }
+
+    function Upsert-EnvVar {
+        param([string]$Key, [string]$Value)
+        if ($content -match "(?m)^${Key}=.*") {
+            $script:content = $content -replace "(?m)^${Key}=.*", "${Key}=${Value}"
+        } else {
+            $script:content += "`n${Key}=${Value}"
+        }
+    }
 
     $changed = $false
-    if ($Token) { $envContent = Set-EnvLine $envContent "SKYTOWER_TOKEN" $Token; $changed = $true }
-    if ($Url)   { $envContent = Set-EnvLine $envContent "SKYTOWER_URL"   $Url;   $changed = $true }
+    if ($Token) { Upsert-EnvVar "SKYTOWER_TOKEN" $Token; $changed = $true }
+    if ($Url)   { Upsert-EnvVar "SKYTOWER_URL"   $Url;   $changed = $true }
 
-    if ($envContent -notmatch "(?m)^SKYTOWER_ALLOW_ALL_USERS=") {
-        $envContent += "`nSKYTOWER_ALLOW_ALL_USERS=true"
+    if ($content -notmatch "(?m)^SKYTOWER_ALLOW_ALL_USERS=") {
+        $content += "`nSKYTOWER_ALLOW_ALL_USERS=true"
     }
-    if ($envContent -notmatch "(?m)^SKYTOWER_PRINT_PAIR_CODE=") {
-        $envContent += "`nSKYTOWER_PRINT_PAIR_CODE=1"
+    if ($content -notmatch "(?m)^SKYTOWER_PRINT_PAIR_CODE=") {
+        $content += "`nSKYTOWER_PRINT_PAIR_CODE=0"
     }
 
-    Set-Content -Path $envFile -Value $envContent.TrimStart() -Encoding UTF8
+    Set-Content $envFile $content.TrimStart()
 
     if ($changed) {
         Write-Success "Skytower 설정 저장됨: $envFile"
     } else {
-        Write-Warn "토큰을 나중에 $envFile 에 직접 추가하세요:"
+        Write-Warn "토큰/URL을 나중에 $envFile 에 직접 추가하세요:"
         Write-Host "  SKYTOWER_TOKEN=agentId:rawToken" -ForegroundColor Yellow
+        Write-Host "  SKYTOWER_URL=https://relay.example.com" -ForegroundColor Yellow
     }
 }
 
@@ -381,7 +321,6 @@ function Write-SuccessBanner {
     Write-Host "  /chatid    현재 대화 JID 확인"
     Write-Host "  /sethome   현재 대화를 홈 채널로 설정"
     Write-Host "  /skills    사용 가능한 스킬 목록"
-    Write-Host "  /paircode  친구 추가 코드 발급 (10분 유효)"
     Write-Host ""
 
     $envFile = "$HermesHomeDir\.env"
@@ -403,32 +342,12 @@ $InstallDir   = Find-HermesInstall
 $HermesHomeResolved = Resolve-HermesHome -InstallDir $InstallDir
 $PythonExe    = Find-Python   -InstallDir $InstallDir
 $UvExe        = Find-Uv       -InstallDir $InstallDir
-# iex (irm ...) 방식으로 실행하면 MyCommand.Path가 $null — 미리 guard
-$ScriptDir = if ($MyInvocation.MyCommand.Path) {
-    Split-Path -Parent $MyInvocation.MyCommand.Path
-} else {
-    $PWD.Path
-}
+$ScriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $ScriptDir) { $ScriptDir = $PWD.Path }
 
 Install-PluginFiles -InstallDir $InstallDir -ScriptDir $ScriptDir
 Install-Deps        -InstallDir $InstallDir -PythonExe $PythonExe -UvExe $UvExe
-
-# .env에 이미 토큰이 있으면 자동 등록 스킵
-if (-not $Token) {
-    $envFile = "$HermesHomeResolved\.env"
-    if (Test-Path $envFile) {
-        $existing = (Get-Content $envFile -ErrorAction SilentlyContinue |
-            Where-Object { $_ -match "^SKYTOWER_TOKEN=.+" }) -replace "^SKYTOWER_TOKEN=", ""
-        if ($existing) {
-            $Token = $existing
-            Write-Info "기존 토큰 발견 — 자동 등록 스킵"
-        }
-    }
-}
-
-$ResolvedToken = Get-SkytowerToken -RelayUrl $Url -ExistingToken $Token
-
-Configure-Env       -HermesHomeDir $HermesHomeResolved -Token $ResolvedToken -Url $Url
+Configure-Env       -HermesHomeDir $HermesHomeResolved
 Test-Plugin         -InstallDir $InstallDir -PythonExe $PythonExe
 
 Write-SuccessBanner -InstallDir $InstallDir -HermesHomeDir $HermesHomeResolved

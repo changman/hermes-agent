@@ -11,8 +11,8 @@
 # 2단계 — Skytower 채널 추가:
 #   curl -fsSL https://raw.githubusercontent.com/changman/hermes-agent/skytower/scripts/install-skytower.sh | bash
 #
-# 또는 토큰을 미리 지정:
-#   curl -fsSL ... | bash -s -- --token "agentId:rawToken"
+# 또는 토큰/URL을 미리 지정:
+#   curl -fsSL ... | bash -s -- --token "agentId:rawToken" --url "https://relay.example.com"
 #
 # ============================================================================
 
@@ -32,18 +32,14 @@ PLUGIN_REPO="https://raw.githubusercontent.com/changman/hermes-agent/skytower"
 PLUGIN_FILES=(
     "plugins/platforms/skytower/__init__.py"
     "plugins/platforms/skytower/adapter.py"
-    "plugins/platforms/skytower/soul_sync.py"
     "plugins/platforms/skytower/plugin.yaml"
     "gateway/platforms/skytower_files.py"
-    "gateway/commands_parser.py"
-    "hermes_cli/gateway_windows.py"
-    "gateway/status.py"
 )
 
 # Hermes home / install detection
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 SKYTOWER_TOKEN="${SKYTOWER_TOKEN:-}"
-SKYTOWER_URL="${SKYTOWER_URL:-https://skytower-api.codescape.biz}"
+SKYTOWER_URL="${SKYTOWER_URL:-}"
 
 # Detect non-interactive mode
 if [ -t 0 ]; then IS_INTERACTIVE=true; else IS_INTERACTIVE=false; fi
@@ -52,6 +48,7 @@ if [ -t 0 ]; then IS_INTERACTIVE=true; else IS_INTERACTIVE=false; fi
 while [[ $# -gt 0 ]]; do
     case $1 in
         --token)      SKYTOWER_TOKEN="$2"; shift 2 ;;
+        --url)        SKYTOWER_URL="$2";   shift 2 ;;
         --hermes-home) HERMES_HOME="$2";   shift 2 ;;
         -h|--help)
             echo "Skytower Add-on Installer for Hermes Agent"
@@ -59,11 +56,13 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: install-skytower.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --token TOKEN       Skytower agent token (agentId:rawToken)"
+            echo "  --token TOKEN     Skytower agent token (agentId:rawToken)"
+            echo "  --url URL         Skytower Relay URL (https://relay.example.com)"
             echo "  --hermes-home PATH  Hermes data directory (default: ~/.hermes)"
             echo ""
             echo "Environment variables:"
             echo "  SKYTOWER_TOKEN    Skytower agent token"
+            echo "  SKYTOWER_URL      Skytower Relay URL"
             echo "  HERMES_HOME       Hermes data directory"
             exit 0
             ;;
@@ -173,13 +172,6 @@ install_plugin_files() {
         if [ -f "$local_files_py" ]; then
             cp "$local_files_py" "$HERMES_INSTALL_DIR/gateway/platforms/skytower_files.py"
         fi
-
-        # Windows CP949 인코딩 버그 수정 파일
-        local local_gw_win="$script_dir/../hermes_cli/gateway_windows.py"
-        local local_status="$script_dir/../gateway/status.py"
-        [ -f "$local_gw_win" ] && cp "$local_gw_win" "$HERMES_INSTALL_DIR/hermes_cli/gateway_windows.py"
-        [ -f "$local_status"  ] && cp "$local_status"  "$HERMES_INSTALL_DIR/gateway/status.py"
-
         log_success "플러그인 파일 복사 완료"
     else
         # 원격에서 다운로드
@@ -232,55 +224,17 @@ configure_env() {
     local env_file="$HERMES_HOME/.env"
     [ -f "$env_file" ] || touch "$env_file"
 
-    # .env에 이미 토큰이 있으면 자동 등록 스킵
-    if [ -z "$SKYTOWER_TOKEN" ] && [ -f "$HERMES_HOME/.env" ]; then
-        existing=$(grep "^SKYTOWER_TOKEN=." "$HERMES_HOME/.env" 2>/dev/null | cut -d'=' -f2-)
-        if [ -n "$existing" ]; then
-            SKYTOWER_TOKEN="$existing"
-            log_info "기존 토큰 발견 — 자동 등록 스킵"
-        fi
-    fi
-
-    # 인터랙티브 모드에서 토큰 획득 (자동 등록 또는 수동 입력)
-    if [ -e /dev/tty ] && [ -z "$SKYTOWER_TOKEN" ]; then
-        printf "\n${CYAN}  Skytower 에이전트 토큰이 없습니다.${NC}\n" > /dev/tty
-        printf "${CYAN}  Skytower 서버에 새 에이전트를 자동 등록할 수 있습니다.${NC}\n\n" > /dev/tty
-        printf "${CYAN}→${NC} 자동 등록하시겠습니까? (Y/n): " > /dev/tty
-        IFS= read -r _auto_reg < /dev/tty || _auto_reg=""
-        _auto_reg="${_auto_reg:-Y}"
-
-        if [[ "$_auto_reg" =~ ^[Yy]$ ]]; then
-            printf "${CYAN}→${NC} 에이전트 이름 (기본값: My Hermes Agent): " > /dev/tty
-            IFS= read -r _agent_name < /dev/tty || _agent_name=""
-            _agent_name="${_agent_name:-My Hermes Agent}"
-            _agent_name="${_agent_name#"${_agent_name%%[![:space:]]*}"}"
-            [ -z "$_agent_name" ] && _agent_name="My Hermes Agent"
-
-            log_info "Skytower 서버에 에이전트 등록 중: $_agent_name"
-
-            _reg_response=$(curl -fsSL -X POST "$SKYTOWER_URL/api/agents/register" \
-                -H "Content-Type: application/json" \
-                -d "{\"name\":\"$_agent_name\"}" 2>/dev/null) || _reg_response=""
-
-            if [ -z "$_reg_response" ]; then
-                log_error "에이전트 등록 실패 — 서버에 연결할 수 없습니다: $SKYTOWER_URL"
-            else
-                _agent_id=$(printf '%s' "$_reg_response" | grep -o '"agentId":"[^"]*"' | cut -d'"' -f4)
-                _raw_token=$(printf '%s' "$_reg_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
-
-                if [ -n "$_agent_id" ] && [ -n "$_raw_token" ]; then
-                    SKYTOWER_TOKEN="$_raw_token"
-                    log_success "에이전트 등록 완료: $_agent_id"
-                    printf "\n${YELLOW}${BOLD}  [!] 토큰은 재발급 불가 — 안전한 곳에 보관하세요:${NC}\n" > /dev/tty
-                    printf "      ${GREEN}${BOLD}%s${NC}\n\n" "$SKYTOWER_TOKEN" > /dev/tty
-                else
-                    log_error "에이전트 등록 응답 파싱 실패: $_reg_response"
-                fi
-            fi
-        else
-            printf "${CYAN}→${NC} Skytower 에이전트 토큰 입력 (agentId:rawToken): " > /dev/tty
+    # 인터랙티브 모드에서 입력 받기
+    if [ -e /dev/tty ]; then
+        if [ -z "$SKYTOWER_TOKEN" ]; then
+            printf "\n${CYAN}→${NC} Skytower 에이전트 토큰 입력 (agentId:rawToken, 없으면 Enter): " > /dev/tty
             IFS= read -r SKYTOWER_TOKEN < /dev/tty || SKYTOWER_TOKEN=""
             SKYTOWER_TOKEN="${SKYTOWER_TOKEN#"${SKYTOWER_TOKEN%%[![:space:]]*}"}"
+        fi
+        if [ -z "$SKYTOWER_URL" ]; then
+            printf "${CYAN}→${NC} Skytower Relay URL 입력 (예: https://relay.example.com, 없으면 Enter): " > /dev/tty
+            IFS= read -r SKYTOWER_URL < /dev/tty || SKYTOWER_URL=""
+            SKYTOWER_URL="${SKYTOWER_URL#"${SKYTOWER_URL%%[![:space:]]*}"}"
         fi
     fi
 
@@ -308,7 +262,7 @@ configure_env() {
     grep -q "^SKYTOWER_ALLOW_ALL_USERS=" "$env_file" 2>/dev/null || \
         printf "SKYTOWER_ALLOW_ALL_USERS=true\n" >> "$env_file"
     grep -q "^SKYTOWER_PRINT_PAIR_CODE=" "$env_file" 2>/dev/null || \
-        printf "SKYTOWER_PRINT_PAIR_CODE=1\n" >> "$env_file"
+        printf "SKYTOWER_PRINT_PAIR_CODE=0\n" >> "$env_file"
 
     if [ "$changed" = true ]; then
         log_success "Skytower 설정 저장됨: $env_file"
@@ -317,7 +271,32 @@ configure_env() {
         log_warn "  SKYTOWER_TOKEN=agentId:rawToken"
         log_warn "  SKYTOWER_URL=https://relay.example.com"
     fi
+
+    log_success "의존성 설치 완료"
 }
+
+# ============================================================================
+# 동작 확인
+# ============================================================================
+
+verify_plugin() {
+    log_info "플러그인 로드 확인 중..."
+    if "$HERMES_PYTHON" -c "
+import sys
+sys.path.insert(0, '$HERMES_INSTALL_DIR')
+from plugins.platforms.skytower import register
+print('OK')
+" 2>/dev/null | grep -q "OK"; then
+        log_success "플러그인 로드 확인 완료"
+    else
+        log_warn "플러그인 로드 확인 실패 — 설치는 완료됐지만 import 테스트에 실패했습니다"
+        log_warn "의존성(python-socketio)이 설치됐는지 확인하세요"
+    fi
+}
+
+# ============================================================================
+# 완료 메시지
+# ============================================================================
 
 # ============================================================================
 # 동작 확인
