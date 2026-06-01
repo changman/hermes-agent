@@ -1,7 +1,4 @@
-"""Skytower Relay platform adapter — legacy shim.
-
-이 파일은 이전 버전 호환용입니다.
-실제 구현은 plugins/platforms/skytower/adapter.py 로 이동했습니다.
+"""Skytower Relay platform adapter.
 
 Connects Hermes to the Skytower Relay Server via Socket.IO.
 
@@ -40,8 +37,12 @@ import base64
 import json
 import logging
 import os
-from pathlib import Path
+import sys
+from pathlib import Path as _Path
 from typing import Any, Dict, List, Optional
+
+# Ensure the repo root is importable when this plugin runs standalone
+sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -62,7 +63,7 @@ _HOME_CHANNELS_FILE = "skytower_home_channels.json"
 # Per-user home channel persistence
 # ---------------------------------------------------------------------------
 
-def _home_channels_path() -> Path:
+def _home_channels_path() -> _Path:
     from hermes_constants import get_hermes_home
     return get_hermes_home() / _HOME_CHANNELS_FILE
 
@@ -95,6 +96,21 @@ def check_skytower_requirements() -> bool:
         return False
 
 
+def _is_connected(cfg: PlatformConfig) -> bool:
+    token = cfg.extra.get("token") or os.getenv("SKYTOWER_TOKEN", "")
+    url = cfg.extra.get("url") or os.getenv("SKYTOWER_URL", "")
+    return bool(token and url)
+
+
+def _env_enablement_fn() -> Optional[Dict[str, Any]]:
+    """Seed PlatformConfig.extra from env vars so the gateway can auto-enable."""
+    token = os.getenv("SKYTOWER_TOKEN", "")
+    url = os.getenv("SKYTOWER_URL", "")
+    if token and url:
+        return {"token": token, "url": url}
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -103,7 +119,7 @@ class SkyTowerAdapter(BasePlatformAdapter):
     """Hermes platform adapter for Skytower Relay Server."""
 
     def __init__(self, config: PlatformConfig):
-        super().__init__(config, Platform.SKYTOWER)
+        super().__init__(config, Platform("skytower"))
         extra = config.extra or {}
 
         raw_token = extra.get("token") or os.getenv("SKYTOWER_TOKEN", "")
@@ -116,15 +132,12 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._sio: Optional[Any] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._intentional_disconnect: bool = False
-        self._pending_thinking: Optional[str] = None  # 다음 send()에 포함할 reasoning
-        self._pending_usage: Optional[Dict[str, int]] = None  # 다음 send()에 포함할 turn token delta
-        self._prev_input_tokens: int = 0   # delta 계산용 직전 누적 input tokens
-        self._prev_output_tokens: int = 0  # delta 계산용 직전 누적 output tokens
+        self._pending_thinking: Optional[str] = None
+        self._pending_usage: Optional[Dict[str, int]] = None
+        self._prev_input_tokens: int = 0
+        self._prev_output_tokens: int = 0
 
-        # Per-user home channel: {user_id → conv_id}
         self._home_channels: Dict[str, str] = _load_home_channels()
-
-        # File access handler — re-initialized in connect() with the live sio
         self._file_handler: Optional[FileAccessHandler] = None
 
     # ── Per-user home channel ─────────────────────────────────────────────────
@@ -272,7 +285,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
         msg_type = data.get("type", "text")
         file_content = data.get("file_content")
 
-        # text 타입이거나, file_content가 있는 경우만 처리
         if msg_type != "text" and not file_content:
             logger.warning("on_message dropped: type=%r with no file_content", msg_type)
             return
@@ -323,20 +335,17 @@ class SkyTowerAdapter(BasePlatformAdapter):
         from gateway.platforms.base import resolve_channel_skills, resolve_channel_prompt
         extra = self.config.extra or {}
 
-        # conv_id를 채널 식별자로 사용 (없으면 user_id를 fallback)
         _lookup_id  = conv_str or user_str
         _parent_id  = user_str if conv_str else None
 
         auto_skill = resolve_channel_skills(extra, _lookup_id, _parent_id)
         if auto_skill is None:
-            # 전역 default_skill 적용
             _default = (extra.get("default_skill") or "").strip()
             if _default:
                 auto_skill = [_default]
 
         channel_prompt = resolve_channel_prompt(extra, _lookup_id, _parent_id)
 
-        # 채널 표시명 (config.yaml channel_names 또는 user_name)
         channel_names: dict = extra.get("channel_names") or {}
         chat_topic: str | None = None
         if conv_str:
@@ -467,7 +476,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
     # ── /skills ───────────────────────────────────────────────────────────────
 
     async def _handle_skills_command(self, user_id: str, conv_id: Optional[str]) -> None:
-        """사용 가능한 스킬 목록을 표시합니다."""
         try:
             from agent.skill_commands import scan_skill_commands
             skill_cmds = scan_skill_commands()
@@ -508,7 +516,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
     # ── request:agent-skills ─────────────────────────────────────────────────
 
     async def _handle_agent_skills_request(self, data: dict) -> None:
-        """Skytower Server의 스킬 조회 요청에 응답합니다."""
         if not self._sio or not self._sio.connected:
             return
         request_id = data.get("requestId", "")
@@ -553,13 +560,11 @@ class SkyTowerAdapter(BasePlatformAdapter):
             user_id = conversation_id = None
 
         payload: Dict[str, Any] = {"content": content, "type": "text"}
-        # _pending_thinking: gateway/run.py가 reasoning을 임시 저장, 여기서 소비
         if self._pending_thinking:
             payload["thinking"] = self._pending_thinking
             self._pending_thinking = None
         elif metadata and metadata.get("thinking"):
             payload["thinking"] = metadata["thinking"]
-        # _pending_usage: gateway/run.py가 turn delta token 수를 임시 저장, 여기서 소비
         if self._pending_usage:
             payload["usage"] = self._pending_usage
             self._pending_usage = None
@@ -669,3 +674,24 @@ class SkyTowerAdapter(BasePlatformAdapter):
             print("=" * 40)
         except Exception as e:
             logger.warning("Failed to fetch pairing code: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Plugin entry point
+# ---------------------------------------------------------------------------
+
+def register(ctx) -> None:
+    """Plugin entry point — called by the Hermes plugin system at gateway startup."""
+    ctx.register_platform(
+        name="skytower",
+        label="Skytower",
+        adapter_factory=lambda cfg: SkyTowerAdapter(cfg),
+        check_fn=check_skytower_requirements,
+        is_connected=_is_connected,
+        env_enablement_fn=_env_enablement_fn,
+        required_env=["SKYTOWER_TOKEN", "SKYTOWER_URL"],
+        install_hint="pip install 'python-socketio[asyncio_client]' psutil",
+        allowed_users_env="SKYTOWER_ALLOWED_USERS",
+        allow_all_env="SKYTOWER_ALLOW_ALL_USERS",
+        emoji="🗼",
+    )

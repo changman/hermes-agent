@@ -3994,7 +3994,6 @@ class GatewayRunner:
             "QQ_ALLOWED_USERS",
             "YUANBAO_ALLOWED_USERS",
             "GATEWAY_ALLOWED_USERS",
-            "SKYTOWER_ALLOWED_USERS"
         )
         _builtin_allow_all_vars = (
             "TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
@@ -4009,7 +4008,6 @@ class GatewayRunner:
             "BLUEBUBBLES_ALLOW_ALL_USERS",
             "QQ_ALLOW_ALL_USERS",
             "YUANBAO_ALLOW_ALL_USERS",
-            "SKYTOWER_ALLOW_ALL_USERS",
         )
         # Also pick up plugin-registered platforms — each entry can declare
         # its own allowed_users_env / allow_all_env, so the warning stays
@@ -6435,17 +6433,6 @@ class GatewayRunner:
                 logger.warning("Yuanbao: websockets not installed. Run: pip install websockets")
                 return None
             return YuanbaoAdapter(config)
-        elif platform == Platform.SKYTOWER:
-            from gateway.platforms.skytower import SkyTowerAdapter, check_skytower_requirements
-            if not check_skytower_requirements():
-                logger.error(
-                    "Skytower: python-socketio not installed. "
-                    "Run: pip install 'python-socketio[asyncio_client]'"
-                )
-                return None
-            return SkyTowerAdapter(config)
-
-        return None
 
         return None
     def _is_user_authorized(self, source: SessionSource) -> bool:
