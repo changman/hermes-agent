@@ -18,9 +18,11 @@
 
 param(
     [string]$Token      = $env:SKYTOWER_TOKEN,
-    [string]$Url        = $(if ($env:SKYTOWER_URL) { $env:SKYTOWER_URL } else { "https://skytower-api.codescape.biz" }),
+    [string]$Url        = $env:SKYTOWER_URL,
     [string]$HermesHome = ""
 )
+
+if (-not $Url) { $script:Url = "https://skytower-api.codescape.biz" }
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference    = "SilentlyContinue"
@@ -256,7 +258,7 @@ function Configure-Env {
     if (-not (Test-Path $envFile)) { New-Item -ItemType File -Force -Path $envFile | Out-Null }
 
     # 토큰 미설정 시 자동 등록 제안
-    if (-not $Token -and $Url) {
+    if (-not $script:Token -and $script:Url) {
         Write-Host ""
         Write-Host "  Skytower 에이전트 토큰이 없습니다." -ForegroundColor Yellow
         Write-Host "  Skytower 서버에 새 에이전트를 자동 등록할 수 있습니다." -ForegroundColor Yellow
@@ -266,14 +268,13 @@ function Configure-Env {
             $defaultName = "My Hermes Agent"
             $agentName = Read-Host "에이전트 이름 (기본값: $defaultName)"
             if (-not $agentName) { $agentName = $defaultName }
-            $script:Token = Register-SkytowerAgent -RelayUrl $Url -AgentName $agentName
+            $script:Token = Register-SkytowerAgent -RelayUrl $script:Url -AgentName $agentName
         }
     }
 
     # 여전히 토큰이 없으면 수동 입력
-    if (-not $Token) {
-        $Token = Read-Host "`nSkytower 에이전트 토큰 입력 (agentId:rawToken, 없으면 Enter)"
-        $Token = $Token.Trim()
+    if (-not $script:Token) {
+        $script:Token = (Read-Host "`nSkytower 에이전트 토큰 입력 (agentId:rawToken, 없으면 Enter)").Trim()
     }
 
     $content = Get-Content $envFile -Raw -ErrorAction SilentlyContinue
@@ -289,8 +290,8 @@ function Configure-Env {
     }
 
     $changed = $false
-    if ($Token) { Upsert-EnvVar "SKYTOWER_TOKEN" $Token; $changed = $true }
-    if ($Url)   { Upsert-EnvVar "SKYTOWER_URL"   $Url;   $changed = $true }
+    if ($script:Token) { Upsert-EnvVar "SKYTOWER_TOKEN" $script:Token; $changed = $true }
+    if ($script:Url)   { Upsert-EnvVar "SKYTOWER_URL"   $script:Url;   $changed = $true }
 
     if ($content -notmatch "(?m)^SKYTOWER_ALLOW_ALL_USERS=") {
         $content += "`nSKYTOWER_ALLOW_ALL_USERS=true"
