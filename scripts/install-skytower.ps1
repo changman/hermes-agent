@@ -277,30 +277,31 @@ function Configure-Env {
         $script:Token = (Read-Host "`nSkytower 에이전트 토큰 입력 (agentId:rawToken, 없으면 Enter)").Trim()
     }
 
-    $script:content = Get-Content $envFile -Raw -ErrorAction SilentlyContinue
-    if (-not $script:content) { $script:content = "" }
+    [string]$envContent = (Get-Content $envFile -Raw -ErrorAction SilentlyContinue)
+    if (-not $envContent) { $envContent = "" }
 
+    # 반환값 방식으로 스코프 문제 회피
     function Upsert-EnvVar {
-        param([string]$Key, [string]$Value)
-        if ($script:content -match "(?m)^${Key}=.*") {
-            $script:content = $script:content -replace "(?m)^${Key}=.*", "${Key}=${Value}"
+        param([string]$FileContent, [string]$Key, [string]$Value)
+        if ($FileContent -match "(?m)^${Key}=.*") {
+            return $FileContent -replace "(?m)^${Key}=.*", "${Key}=${Value}"
         } else {
-            $script:content += "`n${Key}=${Value}"
+            return $FileContent + "`n${Key}=${Value}"
         }
     }
 
     $changed = $false
-    if ($script:Token) { Upsert-EnvVar "SKYTOWER_TOKEN" $script:Token; $changed = $true }
-    if ($script:Url)   { Upsert-EnvVar "SKYTOWER_URL"   $script:Url;   $changed = $true }
+    if ($script:Token) { $envContent = Upsert-EnvVar $envContent "SKYTOWER_TOKEN" $script:Token; $changed = $true }
+    if ($script:Url)   { $envContent = Upsert-EnvVar $envContent "SKYTOWER_URL"   $script:Url;   $changed = $true }
 
-    if ($script:content -notmatch "(?m)^SKYTOWER_ALLOW_ALL_USERS=") {
-        $script:content += "`nSKYTOWER_ALLOW_ALL_USERS=true"
+    if ($envContent -notmatch "(?m)^SKYTOWER_ALLOW_ALL_USERS=") {
+        $envContent += "`nSKYTOWER_ALLOW_ALL_USERS=true"
     }
-    if ($script:content -notmatch "(?m)^SKYTOWER_PRINT_PAIR_CODE=") {
-        $script:content += "`nSKYTOWER_PRINT_PAIR_CODE=0"
+    if ($envContent -notmatch "(?m)^SKYTOWER_PRINT_PAIR_CODE=") {
+        $envContent += "`nSKYTOWER_PRINT_PAIR_CODE=0"
     }
 
-    Set-Content $envFile $script:content.TrimStart()
+    Set-Content $envFile $envContent.TrimStart()
 
     if ($changed) {
         Write-Success "Skytower 설정 저장됨: $envFile"
