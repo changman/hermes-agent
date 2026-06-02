@@ -161,6 +161,16 @@ function Install-PluginFiles {
         if (Test-Path $localFilesPy) {
             Copy-Item $localFilesPy "$InstallDir\gateway\platforms\skytower_files.py" -Force
         }
+
+        # Windows CP949 인코딩 버그 수정 파일
+        $localGatewayWindows = [System.IO.Path]::GetFullPath("$ScriptDir\..\hermes_cli\gateway_windows.py")
+        $localStatusPy       = [System.IO.Path]::GetFullPath("$ScriptDir\..\gateway\status.py")
+        if (Test-Path $localGatewayWindows) {
+            Copy-Item $localGatewayWindows "$InstallDir\hermes_cli\gateway_windows.py" -Force
+        }
+        if (Test-Path $localStatusPy) {
+            Copy-Item $localStatusPy "$InstallDir\gateway\status.py" -Force
+        }
         Write-Success "플러그인 파일 복사 완료"
     } else {
         # GitHub에서 다운로드
@@ -171,7 +181,9 @@ function Install-PluginFiles {
             "plugins/platforms/skytower/__init__.py",
             "plugins/platforms/skytower/adapter.py",
             "plugins/platforms/skytower/plugin.yaml",
-            "gateway/platforms/skytower_files.py"
+            "gateway/platforms/skytower_files.py",
+            "hermes_cli/gateway_windows.py",
+            "gateway/status.py"
         )
 
         foreach ($file in $files) {

@@ -34,6 +34,8 @@ PLUGIN_FILES=(
     "plugins/platforms/skytower/adapter.py"
     "plugins/platforms/skytower/plugin.yaml"
     "gateway/platforms/skytower_files.py"
+    "hermes_cli/gateway_windows.py"
+    "gateway/status.py"
 )
 
 # Hermes home / install detection
@@ -169,6 +171,13 @@ install_plugin_files() {
         if [ -f "$local_files_py" ]; then
             cp "$local_files_py" "$HERMES_INSTALL_DIR/gateway/platforms/skytower_files.py"
         fi
+
+        # Windows CP949 인코딩 버그 수정 파일
+        local local_gw_win="$script_dir/../hermes_cli/gateway_windows.py"
+        local local_status="$script_dir/../gateway/status.py"
+        [ -f "$local_gw_win" ] && cp "$local_gw_win" "$HERMES_INSTALL_DIR/hermes_cli/gateway_windows.py"
+        [ -f "$local_status"  ] && cp "$local_status"  "$HERMES_INSTALL_DIR/gateway/status.py"
+
         log_success "플러그인 파일 복사 완료"
     else
         # 원격에서 다운로드
