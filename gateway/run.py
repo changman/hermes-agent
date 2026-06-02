@@ -6503,7 +6503,6 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
-            Platform.SKYTOWER: "SKYTOWER_ALLOWED_USERS",
         }
         platform_group_user_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -6530,7 +6529,6 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
-            Platform.SKYTOWER: "SKYTOWER_ALLOW_ALL_USERS",
         }
         # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
         platform_allow_bots_map = {
@@ -8900,31 +8898,7 @@ class GatewayRunner:
                     else:
                         display_reasoning = last_reasoning.strip()
 
-                    _adapter = self.adapters.get(source.platform)
-                    if _adapter is not None and hasattr(_adapter, "_pending_thinking"):
-                        # Skytower: thinking을 어댑터에 임시 저장 → send()가 message_done에 포함
-                        _adapter._pending_thinking = display_reasoning
-                        logger.warning(
-                            "[REASONING_CONTEXT] 전송 형태: platform=%s, reasoning=%d자 → "
-                            "message_done thinking 필드로 분리 전송 (구분됨)",
-                            source.platform,
-                            len(last_reasoning),
-                        )
-                    else:
-                        # 다른 플랫폼: 기존처럼 content에 prepend
                         response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
-
-            # Skytower: turn delta token usage를 어댑터에 임시 저장 → send()가 message_done에 포함
-            _usage_adapter = self.adapters.get(source.platform)
-            if _usage_adapter is not None and hasattr(_usage_adapter, "_pending_usage"):
-                _curr_input  = agent_result.get("input_tokens", 0) or 0
-                _curr_output = agent_result.get("output_tokens", 0) or 0
-                _usage_adapter._pending_usage = {
-                    "input_tokens":  _curr_input  - _usage_adapter._prev_input_tokens,
-                    "output_tokens": _curr_output - _usage_adapter._prev_output_tokens,
-                }
-                _usage_adapter._prev_input_tokens  = _curr_input
-                _usage_adapter._prev_output_tokens = _curr_output
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
             # Off by default (display.runtime_footer.enabled=false).  When
@@ -16741,33 +16715,6 @@ class GatewayRunner:
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
-            # Skytower: reasoning delta를 실시간으로 thinking_chunk 이벤트로 전송
-            # worker thread → event loop 브리지 (_stream_delta_cb와 동일한 패턴)
-            _reasoning_delta_cb = None
-            _reasoning_adapter = self.adapters.get(source.platform)
-            logger.warning(
-                "[REASONING_CONTEXT] reasoning_callback 설정: platform=%s, adapter=%s, has_send_thinking=%s",
-                source.platform,
-                type(_reasoning_adapter).__name__ if _reasoning_adapter else None,
-                hasattr(_reasoning_adapter, "send_thinking_chunk") if _reasoning_adapter else False,
-            )
-            if _reasoning_adapter is not None and hasattr(_reasoning_adapter, "send_thinking_chunk"):
-                _reasoning_chat_id = source.chat_id
-                def _reasoning_delta_cb(text: str) -> None:
-                    if not _run_still_current():
-                        return
-                    logger.warning(
-                        "[REASONING_CONTEXT] reasoning_delta_cb 호출: %d자, chat_id=%s",
-                        len(text), _reasoning_chat_id,
-                    )
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            _reasoning_adapter.send_thinking_chunk(text, chat_id=_reasoning_chat_id),
-                            _loop_for_step,
-                        )
-                    except Exception as _e:
-                        logger.warning("[REASONING_CONTEXT] send_thinking_chunk 스케줄 실패: %s", _e)
-
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
@@ -16867,7 +16814,6 @@ class GatewayRunner:
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
-            agent.reasoning_callback = _reasoning_delta_cb  # 실시간 reasoning 스트리밍
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
