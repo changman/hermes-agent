@@ -302,7 +302,7 @@ function Configure-Env {
         $envContent += "`nSKYTOWER_ALLOW_ALL_USERS=true"
     }
     if ($envContent -notmatch "(?m)^SKYTOWER_PRINT_PAIR_CODE=") {
-        $envContent += "`nSKYTOWER_PRINT_PAIR_CODE=0"
+        $envContent += "`nSKYTOWER_PRINT_PAIR_CODE=1"
     }
 
     Set-Content -Path $envFile -Value $envContent.TrimStart() -Encoding UTF8

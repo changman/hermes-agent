@@ -93,7 +93,7 @@ Relay URL은 `https://skytower-api.codescape.biz`로 자동 설정됩니다.
 | `SKYTOWER_URL` | - | Skytower Relay 서버 URL (기본값: `https://skytower-api.codescape.biz`) |
 | `SKYTOWER_ALLOW_ALL_USERS` | - | `true` 설정 시 모든 Skytower 사용자 허용 (기본값: `true`) |
 | `SKYTOWER_ALLOWED_USERS` | - | 허용할 사용자 ID 목록 (쉼표 구분, `ALLOW_ALL_USERS=false`일 때 사용) |
-| `SKYTOWER_PRINT_PAIR_CODE` | - | 연결 시 페어링 코드 출력 (`1`=출력, `0`=숨김, 기본값: `0`) |
+| `SKYTOWER_PRINT_PAIR_CODE` | - | 연결 시 터미널에 페어링 코드 출력 (`1`=출력, `0`=숨김, 기본값: `1`) |
 
 `.env` 파일을 직접 수정할 수도 있습니다.
 

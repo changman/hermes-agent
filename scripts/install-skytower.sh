@@ -254,7 +254,7 @@ configure_env() {
     grep -q "^SKYTOWER_ALLOW_ALL_USERS=" "$env_file" 2>/dev/null || \
         printf "SKYTOWER_ALLOW_ALL_USERS=true\n" >> "$env_file"
     grep -q "^SKYTOWER_PRINT_PAIR_CODE=" "$env_file" 2>/dev/null || \
-        printf "SKYTOWER_PRINT_PAIR_CODE=0\n" >> "$env_file"
+        printf "SKYTOWER_PRINT_PAIR_CODE=1\n" >> "$env_file"
 
     if [ "$changed" = true ]; then
         log_success "Skytower 설정 저장됨: $env_file"

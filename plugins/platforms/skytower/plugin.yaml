@@ -27,6 +27,6 @@ optional_env:
     prompt: "Allow all users? (true/false)"
     password: false
   - name: SKYTOWER_PRINT_PAIR_CODE
-    description: "Print pairing code on connect (1=yes, 0=no)"
+    description: "Print pairing code on connect (1=yes, 0=no, default: 1)"
     prompt: "Print pairing code on connect? (1/0)"
     password: false
