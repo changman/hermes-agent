@@ -22,7 +22,7 @@ param(
     [string]$HermesHome = ""
 )
 
-if (-not $Url) { $script:Url = "https://skytower-api.codescape.biz" }
+if (-not $Url) { $Url = "https://skytower-api.codescape.biz" }
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference    = "SilentlyContinue"
@@ -248,51 +248,55 @@ function Register-SkytowerAgent {
 }
 
 # ============================================================================
+# 토큰 획득 (자동 등록 또는 수동 입력)
+# ============================================================================
+
+function Get-SkytowerToken {
+    param([string]$RelayUrl, [string]$ExistingToken)
+
+    if ($ExistingToken) { return $ExistingToken }
+
+    Write-Host ""
+    Write-Host "  Skytower 에이전트 토큰이 없습니다." -ForegroundColor Yellow
+    Write-Host "  Skytower 서버에 새 에이전트를 자동 등록할 수 있습니다." -ForegroundColor Yellow
+    Write-Host ""
+    $doRegister = Read-Host "자동 등록하시겠습니까? (Y/n)"
+    if ($doRegister -ne "n" -and $doRegister -ne "N") {
+        $defaultName = "My Hermes Agent"
+        $agentName = Read-Host "에이전트 이름 (기본값: $defaultName)"
+        if (-not $agentName) { $agentName = $defaultName }
+        $registered = Register-SkytowerAgent -RelayUrl $RelayUrl -AgentName $agentName
+        if ($registered) { return $registered }
+    }
+
+    return (Read-Host "`nSkytower 에이전트 토큰 입력 (agentId:rawToken, 없으면 Enter)").Trim()
+}
+
+# ============================================================================
 # .env 설정
 # ============================================================================
 
+function Set-EnvLine {
+    param([string]$FileContent, [string]$Key, [string]$Value)
+    if ($FileContent -match "(?m)^${Key}=.*") {
+        return $FileContent -replace "(?m)^${Key}=.*", "${Key}=${Value}"
+    } else {
+        return $FileContent + "`n${Key}=${Value}"
+    }
+}
+
 function Configure-Env {
-    param([string]$HermesHomeDir)
+    param([string]$HermesHomeDir, [string]$Token, [string]$Url)
 
     $envFile = "$HermesHomeDir\.env"
-    if (-not (Test-Path $envFile)) { New-Item -ItemType File -Force -Path $envFile | Out-Null }
-
-    # 토큰 미설정 시 자동 등록 제안
-    if (-not $script:Token -and $script:Url) {
-        Write-Host ""
-        Write-Host "  Skytower 에이전트 토큰이 없습니다." -ForegroundColor Yellow
-        Write-Host "  Skytower 서버에 새 에이전트를 자동 등록할 수 있습니다." -ForegroundColor Yellow
-        Write-Host ""
-        $doRegister = Read-Host "자동 등록하시겠습니까? (Y/n)"
-        if ($doRegister -ne "n" -and $doRegister -ne "N") {
-            $defaultName = "My Hermes Agent"
-            $agentName = Read-Host "에이전트 이름 (기본값: $defaultName)"
-            if (-not $agentName) { $agentName = $defaultName }
-            $script:Token = Register-SkytowerAgent -RelayUrl $script:Url -AgentName $agentName
-        }
-    }
-
-    # 여전히 토큰이 없으면 수동 입력
-    if (-not $script:Token) {
-        $script:Token = (Read-Host "`nSkytower 에이전트 토큰 입력 (agentId:rawToken, 없으면 Enter)").Trim()
-    }
+    if (-not (Test-Path $envFile)) { New-Item -ItemType Directory -Force -Path $HermesHomeDir | Out-Null; New-Item -ItemType File -Force -Path $envFile | Out-Null }
 
     [string]$envContent = (Get-Content $envFile -Raw -ErrorAction SilentlyContinue)
     if (-not $envContent) { $envContent = "" }
 
-    # 반환값 방식으로 스코프 문제 회피
-    function Upsert-EnvVar {
-        param([string]$FileContent, [string]$Key, [string]$Value)
-        if ($FileContent -match "(?m)^${Key}=.*") {
-            return $FileContent -replace "(?m)^${Key}=.*", "${Key}=${Value}"
-        } else {
-            return $FileContent + "`n${Key}=${Value}"
-        }
-    }
-
     $changed = $false
-    if ($script:Token) { $envContent = Upsert-EnvVar $envContent "SKYTOWER_TOKEN" $script:Token; $changed = $true }
-    if ($script:Url)   { $envContent = Upsert-EnvVar $envContent "SKYTOWER_URL"   $script:Url;   $changed = $true }
+    if ($Token) { $envContent = Set-EnvLine $envContent "SKYTOWER_TOKEN" $Token; $changed = $true }
+    if ($Url)   { $envContent = Set-EnvLine $envContent "SKYTOWER_URL"   $Url;   $changed = $true }
 
     if ($envContent -notmatch "(?m)^SKYTOWER_ALLOW_ALL_USERS=") {
         $envContent += "`nSKYTOWER_ALLOW_ALL_USERS=true"
@@ -301,7 +305,7 @@ function Configure-Env {
         $envContent += "`nSKYTOWER_PRINT_PAIR_CODE=0"
     }
 
-    Set-Content $envFile $envContent.TrimStart()
+    Set-Content -Path $envFile -Value $envContent.TrimStart() -Encoding UTF8
 
     if ($changed) {
         Write-Success "Skytower 설정 저장됨: $envFile"
@@ -393,7 +397,10 @@ $ScriptDir = if ($MyInvocation.MyCommand.Path) {
 
 Install-PluginFiles -InstallDir $InstallDir -ScriptDir $ScriptDir
 Install-Deps        -InstallDir $InstallDir -PythonExe $PythonExe -UvExe $UvExe
-Configure-Env       -HermesHomeDir $HermesHomeResolved
+
+$ResolvedToken = Get-SkytowerToken -RelayUrl $Url -ExistingToken $Token
+
+Configure-Env       -HermesHomeDir $HermesHomeResolved -Token $ResolvedToken -Url $Url
 Test-Plugin         -InstallDir $InstallDir -PythonExe $PythonExe
 
 Write-SuccessBanner -InstallDir $InstallDir -HermesHomeDir $HermesHomeResolved
