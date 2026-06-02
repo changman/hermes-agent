@@ -277,13 +277,13 @@ function Configure-Env {
         $script:Token = (Read-Host "`nSkytower 에이전트 토큰 입력 (agentId:rawToken, 없으면 Enter)").Trim()
     }
 
-    $content = Get-Content $envFile -Raw -ErrorAction SilentlyContinue
-    if (-not $content) { $content = "" }
+    $script:content = Get-Content $envFile -Raw -ErrorAction SilentlyContinue
+    if (-not $script:content) { $script:content = "" }
 
     function Upsert-EnvVar {
         param([string]$Key, [string]$Value)
-        if ($content -match "(?m)^${Key}=.*") {
-            $script:content = $content -replace "(?m)^${Key}=.*", "${Key}=${Value}"
+        if ($script:content -match "(?m)^${Key}=.*") {
+            $script:content = $script:content -replace "(?m)^${Key}=.*", "${Key}=${Value}"
         } else {
             $script:content += "`n${Key}=${Value}"
         }
@@ -293,14 +293,14 @@ function Configure-Env {
     if ($script:Token) { Upsert-EnvVar "SKYTOWER_TOKEN" $script:Token; $changed = $true }
     if ($script:Url)   { Upsert-EnvVar "SKYTOWER_URL"   $script:Url;   $changed = $true }
 
-    if ($content -notmatch "(?m)^SKYTOWER_ALLOW_ALL_USERS=") {
-        $content += "`nSKYTOWER_ALLOW_ALL_USERS=true"
+    if ($script:content -notmatch "(?m)^SKYTOWER_ALLOW_ALL_USERS=") {
+        $script:content += "`nSKYTOWER_ALLOW_ALL_USERS=true"
     }
-    if ($content -notmatch "(?m)^SKYTOWER_PRINT_PAIR_CODE=") {
-        $content += "`nSKYTOWER_PRINT_PAIR_CODE=0"
+    if ($script:content -notmatch "(?m)^SKYTOWER_PRINT_PAIR_CODE=") {
+        $script:content += "`nSKYTOWER_PRINT_PAIR_CODE=0"
     }
 
-    Set-Content $envFile $content.TrimStart()
+    Set-Content $envFile $script:content.TrimStart()
 
     if ($changed) {
         Write-Success "Skytower 설정 저장됨: $envFile"
