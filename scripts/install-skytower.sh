@@ -230,6 +230,15 @@ configure_env() {
     local env_file="$HERMES_HOME/.env"
     [ -f "$env_file" ] || touch "$env_file"
 
+    # .env에 이미 토큰이 있으면 자동 등록 스킵
+    if [ -z "$SKYTOWER_TOKEN" ] && [ -f "$HERMES_HOME/.env" ]; then
+        existing=$(grep "^SKYTOWER_TOKEN=." "$HERMES_HOME/.env" 2>/dev/null | cut -d'=' -f2-)
+        if [ -n "$existing" ]; then
+            SKYTOWER_TOKEN="$existing"
+            log_info "기존 토큰 발견 — 자동 등록 스킵"
+        fi
+    fi
+
     # 인터랙티브 모드에서 입력 받기
     if [ -e /dev/tty ]; then
         if [ -z "$SKYTOWER_TOKEN" ]; then

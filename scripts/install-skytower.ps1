@@ -411,6 +411,19 @@ $ScriptDir = if ($MyInvocation.MyCommand.Path) {
 Install-PluginFiles -InstallDir $InstallDir -ScriptDir $ScriptDir
 Install-Deps        -InstallDir $InstallDir -PythonExe $PythonExe -UvExe $UvExe
 
+# .env에 이미 토큰이 있으면 자동 등록 스킵
+if (-not $Token) {
+    $envFile = "$HermesHomeResolved\.env"
+    if (Test-Path $envFile) {
+        $existing = (Get-Content $envFile -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match "^SKYTOWER_TOKEN=.+" }) -replace "^SKYTOWER_TOKEN=", ""
+        if ($existing) {
+            $Token = $existing
+            Write-Info "기존 토큰 발견 — 자동 등록 스킵"
+        }
+    }
+}
+
 $ResolvedToken = Get-SkytowerToken -RelayUrl $Url -ExistingToken $Token
 
 Configure-Env       -HermesHomeDir $HermesHomeResolved -Token $ResolvedToken -Url $Url

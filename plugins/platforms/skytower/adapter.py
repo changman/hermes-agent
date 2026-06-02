@@ -172,7 +172,15 @@ class SkyTowerAdapter(BasePlatformAdapter):
             await self._sio.emit("heartbeat", self._collect_metrics())
             if self._heartbeat_task is None or self._heartbeat_task.done():
                 self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            if os.getenv("SKYTOWER_PRINT_PAIR_CODE", "").lower() in ("1", "true", "yes"):
+            _print_pair = os.getenv("SKYTOWER_PRINT_PAIR_CODE", "1").lower() in ("1", "true", "yes")
+            _is_service = os.getenv("HERMES_GATEWAY_DETACHED", "") == "1"
+            if not _is_service:
+                try:
+                    import sys
+                    _is_service = not sys.stdout.isatty()
+                except Exception:
+                    pass
+            if _print_pair and not _is_service:
                 await self._print_pairing_code()
 
         @self._sio.event
