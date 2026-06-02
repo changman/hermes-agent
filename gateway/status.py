@@ -84,9 +84,6 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
             result = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
-                # text=True + encoding 조합은 Python 3.11.9 Windows에서
-                # TextIOWrapper에 errors가 전달되지 않아 CP949 출력을 UTF-8로
-                # 디코딩하려다 UnicodeDecodeError가 발생함. bytes로 받아 수동 디코딩.
                 timeout=10,
             )
         except FileNotFoundError:
