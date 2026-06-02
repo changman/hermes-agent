@@ -137,6 +137,7 @@ hermes gateway install
 | `/chatid` | 현재 대화의 JID 확인 |
 | `/sethome` | 현재 대화를 홈 채널로 설정 |
 | `/skills` | 사용 가능한 스킬 목록 조회 |
+| `/paircode` | 친구 추가 코드 발급 (10분 유효, 1회 사용) |
 
 ---
 

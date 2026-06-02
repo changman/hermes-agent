@@ -367,6 +367,7 @@ function Write-SuccessBanner {
     Write-Host "  /chatid    현재 대화 JID 확인"
     Write-Host "  /sethome   현재 대화를 홈 채널로 설정"
     Write-Host "  /skills    사용 가능한 스킬 목록"
+    Write-Host "  /paircode  친구 추가 코드 발급 (10분 유효)"
     Write-Host ""
 
     $envFile = "$HermesHomeDir\.env"

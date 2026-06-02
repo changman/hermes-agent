@@ -311,6 +311,10 @@ class SkyTowerAdapter(BasePlatformAdapter):
             await self._handle_skills_command(user_str, conv_str)
             return
 
+        if content == "/paircode":
+            await self._handle_paircode(user_str, conv_str)
+            return
+
         # ── file_content 처리 ─────────────────────────────────────────────────
         media_urls: List[str] = []
         media_types: List[str] = []
@@ -641,6 +645,34 @@ class SkyTowerAdapter(BasePlatformAdapter):
             }
         except ImportError:
             return {"cpu": 0.0, "mem": 0.0, "disk": 0.0, "agent_type": "hermes"}
+
+    # ── /paircode ─────────────────────────────────────────────────────────────
+
+    async def _handle_paircode(self, user_id: str, conv_id: Optional[str]) -> None:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{self._relay_url}/api/agents/pairing-code",
+                    headers={"Authorization": f"Bearer {self._token}"},
+                    json={"expiresMinutes": 10, "maxUses": 1},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            code = data.get("code", "N/A")
+            pair_url = data.get("pairUrl", "")
+            text = (
+                f"**친구 추가 코드**\n"
+                f"`{code}`\n\n"
+                f"• 유효시간: 10분 / 1회 사용\n"
+            )
+            if pair_url:
+                text += f"• URL: {pair_url}"
+        except Exception as e:
+            logger.warning("Failed to fetch pairing code: %s", e)
+            text = f"❌ 페어링 코드 발급 실패: {e}"
+
+        await self._reply_user(user_id, conv_id, text)
 
     # ── 온보딩 ────────────────────────────────────────────────────────────────
 
