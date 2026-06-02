@@ -111,18 +111,15 @@ def _exec_schtasks(args: list[str]) -> tuple[int, str, str]:
         proc = subprocess.run(
             [schtasks, *args],
             capture_output=True,
-            text=True,
-            # schtasks.exe는 시스템 코드페이지(한국어 Windows: CP949)로 출력하므로
-            # PYTHONIOENCODING=utf-8 환경에서도 깨지지 않도록 errors='replace' 지정.
-            encoding="utf-8",
-            errors="replace",
+            # text=True + encoding 조합은 Python 3.11.9 Windows에서
+            # TextIOWrapper에 errors가 전달되지 않는 버그로 UnicodeDecodeError 발생.
+            # 바이트로 캡처 후 수동 디코딩하여 CP949 출력을 안전하게 처리.
             timeout=_SCHTASKS_TIMEOUT_S,
-            # CREATE_NO_WINDOW avoids a flashing console window when the CLI
-            # is itself hosted in a TUI. See tools/browser_tool.py for the
-            # same pattern and the windows-subprocess-sigint-storm.md ref.
             creationflags=0x08000000,  # CREATE_NO_WINDOW
         )
-        return (proc.returncode, proc.stdout or "", proc.stderr or "")
+        stdout = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
+        stderr = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
+        return (proc.returncode, stdout, stderr)
     except subprocess.TimeoutExpired:
         return (124, "", f"schtasks timed out after {_SCHTASKS_TIMEOUT_S}s")
     except OSError as e:

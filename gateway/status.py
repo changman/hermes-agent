@@ -84,7 +84,6 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
             result = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
-                text=True,
                 timeout=10,
             )
         except FileNotFoundError:
@@ -92,7 +91,9 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
             return
 
         if result.returncode != 0:
-            details = (result.stderr or result.stdout or "").strip()
+            stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+            stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+            details = (stderr or stdout).strip()
             raise OSError(details or f"taskkill failed for PID {pid}")
         return
 
