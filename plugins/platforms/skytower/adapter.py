@@ -132,10 +132,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._sio: Optional[Any] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._intentional_disconnect: bool = False
-        self._pending_thinking: Optional[str] = None
-        self._pending_usage: Optional[Dict[str, int]] = None
-        self._prev_input_tokens: int = 0
-        self._prev_output_tokens: int = 0
 
         self._home_channels: Dict[str, str] = _load_home_channels()
         self._file_handler: Optional[FileAccessHandler] = None
@@ -560,14 +556,6 @@ class SkyTowerAdapter(BasePlatformAdapter):
             user_id = conversation_id = None
 
         payload: Dict[str, Any] = {"content": content, "type": "text"}
-        if self._pending_thinking:
-            payload["thinking"] = self._pending_thinking
-            self._pending_thinking = None
-        elif metadata and metadata.get("thinking"):
-            payload["thinking"] = metadata["thinking"]
-        if self._pending_usage:
-            payload["usage"] = self._pending_usage
-            self._pending_usage = None
         if conversation_id:
             payload["target_conversation_id"] = conversation_id
         elif user_id:
@@ -597,8 +585,12 @@ class SkyTowerAdapter(BasePlatformAdapter):
                 pass
 
     async def send_thinking_chunk(self, text: str, chat_id: Optional[str] = None) -> None:
+        """실시간 reasoning 스트리밍 — gateway hook이 있을 때 호출됨 (Option B).
+
+        현재(Option C)는 gateway/run.py에 hook이 없으므로 호출되지 않는다.
+        향후 upstream PR이 merge되면 gateway가 이 메서드를 직접 호출한다.
+        """
         if not self._sio or not self._sio.connected:
-            logger.warning("[REASONING_CONTEXT] send_thinking_chunk 실패: sio 미연결")
             return
         try:
             payload: Dict[str, Any] = {"text": text}
@@ -613,13 +605,9 @@ class SkyTowerAdapter(BasePlatformAdapter):
                     payload["target_conversation_id"] = conversation_id
                 elif user_id:
                     payload["target_user_id"] = user_id
-            logger.warning(
-                "[REASONING_CONTEXT] thinking_chunk emit: %d자, payload_keys=%s",
-                len(text), list(payload.keys()),
-            )
             await self._sio.emit("thinking_chunk", payload)
         except Exception as e:
-            logger.warning("[REASONING_CONTEXT] thinking_chunk emit 실패: %s", e)
+            logger.debug("thinking_chunk emit failed: %s", e)
 
     async def send_notification(
         self, title: str, body: str = "", level: str = "info"
