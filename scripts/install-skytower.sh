@@ -11,8 +11,8 @@
 # 2단계 — Skytower 채널 추가:
 #   curl -fsSL https://raw.githubusercontent.com/changman/hermes-agent/skytower/scripts/install-skytower.sh | bash
 #
-# 또는 토큰/URL을 미리 지정:
-#   curl -fsSL ... | bash -s -- --token "agentId:rawToken" --url "https://relay.example.com"
+# 또는 토큰을 미리 지정:
+#   curl -fsSL ... | bash -s -- --token "agentId:rawToken"
 #
 # ============================================================================
 
@@ -39,7 +39,7 @@ PLUGIN_FILES=(
 # Hermes home / install detection
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 SKYTOWER_TOKEN="${SKYTOWER_TOKEN:-}"
-SKYTOWER_URL="${SKYTOWER_URL:-}"
+SKYTOWER_URL="${SKYTOWER_URL:-https://skytower-api.codescape.biz}"
 
 # Detect non-interactive mode
 if [ -t 0 ]; then IS_INTERACTIVE=true; else IS_INTERACTIVE=false; fi
@@ -48,7 +48,6 @@ if [ -t 0 ]; then IS_INTERACTIVE=true; else IS_INTERACTIVE=false; fi
 while [[ $# -gt 0 ]]; do
     case $1 in
         --token)      SKYTOWER_TOKEN="$2"; shift 2 ;;
-        --url)        SKYTOWER_URL="$2";   shift 2 ;;
         --hermes-home) HERMES_HOME="$2";   shift 2 ;;
         -h|--help)
             echo "Skytower Add-on Installer for Hermes Agent"
@@ -56,13 +55,11 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: install-skytower.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --token TOKEN     Skytower agent token (agentId:rawToken)"
-            echo "  --url URL         Skytower Relay URL (https://relay.example.com)"
+            echo "  --token TOKEN       Skytower agent token (agentId:rawToken)"
             echo "  --hermes-home PATH  Hermes data directory (default: ~/.hermes)"
             echo ""
             echo "Environment variables:"
             echo "  SKYTOWER_TOKEN    Skytower agent token"
-            echo "  SKYTOWER_URL      Skytower Relay URL"
             echo "  HERMES_HOME       Hermes data directory"
             exit 0
             ;;
@@ -230,11 +227,6 @@ configure_env() {
             printf "\n${CYAN}→${NC} Skytower 에이전트 토큰 입력 (agentId:rawToken, 없으면 Enter): " > /dev/tty
             IFS= read -r SKYTOWER_TOKEN < /dev/tty || SKYTOWER_TOKEN=""
             SKYTOWER_TOKEN="${SKYTOWER_TOKEN#"${SKYTOWER_TOKEN%%[![:space:]]*}"}"
-        fi
-        if [ -z "$SKYTOWER_URL" ]; then
-            printf "${CYAN}→${NC} Skytower Relay URL 입력 (예: https://relay.example.com, 없으면 Enter): " > /dev/tty
-            IFS= read -r SKYTOWER_URL < /dev/tty || SKYTOWER_URL=""
-            SKYTOWER_URL="${SKYTOWER_URL#"${SKYTOWER_URL%%[![:space:]]*}"}"
         fi
     fi
 

@@ -10,16 +10,15 @@
 # 2단계 - Skytower 채널 추가:
 #   iex (irm https://raw.githubusercontent.com/changman/hermes-agent/skytower/scripts/install-skytower.ps1)
 #
-# 또는 토큰/URL을 미리 지정:
+# 또는 토큰을 미리 지정:
 #   $env:SKYTOWER_TOKEN = "agentId:rawToken"
-#   $env:SKYTOWER_URL   = "https://relay.example.com"
 #   iex (irm https://raw.githubusercontent.com/changman/hermes-agent/skytower/scripts/install-skytower.ps1)
 #
 # ============================================================================
 
 param(
-    [string]$Token     = $env:SKYTOWER_TOKEN,
-    [string]$Url       = $env:SKYTOWER_URL,
+    [string]$Token      = $env:SKYTOWER_TOKEN,
+    [string]$Url        = $(if ($env:SKYTOWER_URL) { $env:SKYTOWER_URL } else { "https://skytower-api.codescape.biz" }),
     [string]$HermesHome = ""
 )
 
@@ -218,6 +217,35 @@ function Install-Deps {
 }
 
 # ============================================================================
+# 에이전트 자동 등록
+# ============================================================================
+
+function Register-SkytowerAgent {
+    param([string]$RelayUrl, [string]$AgentName)
+
+    Write-Info "Skytower 서버에 에이전트 등록 중: $AgentName"
+    $body = "{`"name`": `"$AgentName`"}"
+    try {
+        $resp = Invoke-RestMethod -Uri "$RelayUrl/api/agents/register" `
+            -Method POST `
+            -ContentType "application/json" `
+            -Body $body `
+            -ErrorAction Stop
+        $token = $resp.token
+        if (-not $token) { throw "응답에 token 필드가 없습니다" }
+        Write-Success "에이전트 등록 완료: $($resp.agentId)"
+        Write-Host ""
+        Write-Host "  [!] 토큰은 재발급 불가 — 안전한 곳에 보관하세요:" -ForegroundColor Yellow
+        Write-Host "      $token" -ForegroundColor White
+        Write-Host ""
+        return $token
+    } catch {
+        Write-Warn "자동 등록 실패: $_"
+        return $null
+    }
+}
+
+# ============================================================================
 # .env 설정
 # ============================================================================
 
@@ -227,14 +255,25 @@ function Configure-Env {
     $envFile = "$HermesHomeDir\.env"
     if (-not (Test-Path $envFile)) { New-Item -ItemType File -Force -Path $envFile | Out-Null }
 
-    # 인터랙티브 입력
+    # 토큰 미설정 시 자동 등록 제안
+    if (-not $Token -and $Url) {
+        Write-Host ""
+        Write-Host "  Skytower 에이전트 토큰이 없습니다." -ForegroundColor Yellow
+        Write-Host "  Skytower 서버에 새 에이전트를 자동 등록할 수 있습니다." -ForegroundColor Yellow
+        Write-Host ""
+        $doRegister = Read-Host "자동 등록하시겠습니까? (Y/n)"
+        if ($doRegister -ne "n" -and $doRegister -ne "N") {
+            $defaultName = "My Hermes Agent"
+            $agentName = Read-Host "에이전트 이름 (기본값: $defaultName)"
+            if (-not $agentName) { $agentName = $defaultName }
+            $script:Token = Register-SkytowerAgent -RelayUrl $Url -AgentName $agentName
+        }
+    }
+
+    # 여전히 토큰이 없으면 수동 입력
     if (-not $Token) {
         $Token = Read-Host "`nSkytower 에이전트 토큰 입력 (agentId:rawToken, 없으면 Enter)"
         $Token = $Token.Trim()
-    }
-    if (-not $Url) {
-        $Url = Read-Host "Skytower Relay URL 입력 (예: https://relay.example.com, 없으면 Enter)"
-        $Url = $Url.Trim()
     }
 
     $content = Get-Content $envFile -Raw -ErrorAction SilentlyContinue
@@ -265,9 +304,8 @@ function Configure-Env {
     if ($changed) {
         Write-Success "Skytower 설정 저장됨: $envFile"
     } else {
-        Write-Warn "토큰/URL을 나중에 $envFile 에 직접 추가하세요:"
+        Write-Warn "토큰을 나중에 $envFile 에 직접 추가하세요:"
         Write-Host "  SKYTOWER_TOKEN=agentId:rawToken" -ForegroundColor Yellow
-        Write-Host "  SKYTOWER_URL=https://relay.example.com" -ForegroundColor Yellow
     }
 }
 
