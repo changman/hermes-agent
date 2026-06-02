@@ -84,6 +84,26 @@ def _save_home_channels(mapping: Dict[str, str]) -> None:
         logger.warning("Failed to save home channels: %s", e)
 
 
+def _disable_pair_code_in_env() -> None:
+    """서비스 모드 감지 시 .env의 SKYTOWER_PRINT_PAIR_CODE를 0으로 설정."""
+    try:
+        from hermes_constants import get_hermes_home
+        env_path = get_hermes_home() / ".env"
+        if not env_path.exists():
+            return
+        text = env_path.read_text(encoding="utf-8")
+        import re
+        if re.search(r"(?m)^SKYTOWER_PRINT_PAIR_CODE=", text):
+            new_text = re.sub(r"(?m)^SKYTOWER_PRINT_PAIR_CODE=.*", "SKYTOWER_PRINT_PAIR_CODE=0", text)
+        else:
+            new_text = text.rstrip("\n") + "\nSKYTOWER_PRINT_PAIR_CODE=0\n"
+        if new_text != text:
+            env_path.write_text(new_text, encoding="utf-8")
+            logger.info("서비스 모드 감지 — SKYTOWER_PRINT_PAIR_CODE=0 으로 저장됨")
+    except Exception as e:
+        logger.warning("Failed to update .env SKYTOWER_PRINT_PAIR_CODE: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Requirements check
 # ---------------------------------------------------------------------------
@@ -180,8 +200,12 @@ class SkyTowerAdapter(BasePlatformAdapter):
                     _is_service = not sys.stdout.isatty()
                 except Exception:
                     pass
-            if _print_pair and not _is_service:
-                await self._print_pairing_code()
+            if _is_service:
+                if _print_pair:
+                    _disable_pair_code_in_env()
+            else:
+                if _print_pair:
+                    await self._print_pairing_code()
 
         @self._sio.event
         async def disconnect():
