@@ -29,6 +29,7 @@ Design notes
 from __future__ import annotations
 
 import ctypes
+import locale
 import os
 import re
 import shlex
@@ -50,6 +51,20 @@ _ACCESS_DENIED_PATTERN = re.compile(r"(access is denied|acceso denegado)", re.IG
 
 _TASK_NAME_DEFAULT = "Hermes_Gateway"
 _TASK_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
+
+
+def _schtasks_encoding() -> str:
+    """Best-effort console encoding for decoding ``schtasks.exe`` output.
+
+    On localized Windows (e.g. Chinese), ``schtasks`` emits text in the OEM/ANSI
+    code page rather than UTF-8. Decoding with the wrong codec raised
+    ``UnicodeDecodeError`` inside ``subprocess``' reader threads. Prefer the
+    locale's preferred encoding and fall back to UTF-8.
+    """
+    try:
+        return locale.getpreferredencoding(False) or "utf-8"
+    except Exception:
+        return "utf-8"
 
 
 # ---------------------------------------------------------------------------
@@ -111,9 +126,13 @@ def _exec_schtasks(args: list[str]) -> tuple[int, str, str]:
         proc = subprocess.run(
             [schtasks, *args],
             capture_output=True,
-            # text=True + encoding 조합은 Python 3.11.9 Windows에서
-            # TextIOWrapper에 errors가 전달되지 않는 버그로 UnicodeDecodeError 발생.
-            # 바이트로 캡처 후 수동 디코딩하여 CP949 출력을 안전하게 처리.
+            text=True,
+            # Localized Windows emits schtasks output in the console code page,
+            # not UTF-8. Decode with the locale encoding and replace undecodable
+            # bytes so a non-UTF-8 status line never surfaces a UnicodeDecodeError
+            # traceback from subprocess' reader threads (issue #38172).
+            encoding=_schtasks_encoding(),
+            errors="replace",
             timeout=_SCHTASKS_TIMEOUT_S,
             creationflags=0x08000000,  # CREATE_NO_WINDOW
         )
