@@ -53,7 +53,10 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.platforms.skytower_files import FileAccessHandler
-from gateway.soul_sync import SoulSync
+try:
+    from .soul_sync import SoulSync  # 플러그인 패키지로 로드될 때 (프로덕션)
+except ImportError:
+    from gateway.soul_sync import SoulSync  # standalone 로드 시 fallback (테스트)
 
 logger = logging.getLogger(__name__)
 
