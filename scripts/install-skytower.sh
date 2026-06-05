@@ -32,6 +32,7 @@ PLUGIN_REPO="https://raw.githubusercontent.com/changman/hermes-agent/skytower"
 PLUGIN_FILES=(
     "plugins/platforms/skytower/__init__.py"
     "plugins/platforms/skytower/adapter.py"
+    "plugins/platforms/skytower/soul_sync.py"
     "plugins/platforms/skytower/plugin.yaml"
     "gateway/platforms/skytower_files.py"
     "hermes_cli/gateway_windows.py"
