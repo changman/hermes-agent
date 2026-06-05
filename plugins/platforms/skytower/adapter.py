@@ -53,6 +53,7 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.platforms.skytower_files import FileAccessHandler
+from gateway.soul_sync import SoulSync
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,15 @@ class SkyTowerAdapter(BasePlatformAdapter):
 
         self._home_channels: Dict[str, str] = _load_home_channels()
         self._file_handler: Optional[FileAccessHandler] = None
+
+        # Soul sync: SkyTower → SOUL.md
+        _allow_overwrite = os.getenv("SOUL_ALLOW_OVERWRITE", "").lower() in ("1", "true", "yes")
+        self._soul_sync = SoulSync(
+            agent_id=self._agent_id,
+            token=self._token,
+            relay_url=self._relay_url,
+            allow_overwrite=_allow_overwrite,
+        )
 
     # ── Per-user home channel ─────────────────────────────────────────────────
 
@@ -276,6 +286,16 @@ class SkyTowerAdapter(BasePlatformAdapter):
         @self._sio.on("request:agent-skills")
         async def on_request_agent_skills(data: dict):
             await self._handle_agent_skills_request(data)
+
+        # ── Soul Sync: SkyTower → SOUL.md ────────────────────────────────────
+
+        @self._sio.on("agent:sync-requested")
+        async def on_sync_requested(data: dict):
+            await self._handle_soul_sync_request(data)
+
+        @self._sio.on("soul:persona-updated")
+        async def on_persona_updated(data: dict):
+            await self._handle_soul_persona_updated(data)
 
         try:
             await self._sio.connect(
@@ -571,6 +591,26 @@ class SkyTowerAdapter(BasePlatformAdapter):
                 "version": "1.0.0",
             },
         })
+
+    # ── Soul Sync ─────────────────────────────────────────────────────────────
+
+    async def _handle_soul_sync_request(self, data: dict) -> None:
+        """agent:sync-requested 이벤트 처리. SkyTower로부터 전체 persona 동기화 요청."""
+        logger.info("[SOUL] Received agent:sync-requested event")
+        result = await self._soul_sync.sync_personas()
+        if self._sio and self._sio.connected:
+            try:
+                await self._sio.emit("agent:sync-result", result)
+            except Exception as e:
+                logger.warning("[SOUL] Failed to emit agent:sync-result: %s", e)
+
+    async def _handle_soul_persona_updated(self, data: dict) -> None:
+        """soul:persona-updated 이벤트 처리. 특정 사용자의 persona 즉시 업데이트."""
+        user_id = data.get("userId", "unknown")
+        persona = data.get("persona", "")
+        logger.info("[SOUL] Received soul:persona-updated event (userId: %s)", user_id)
+        if persona:
+            await self._soul_sync.update_soul_file(user_id, persona)
 
     # ── Outbound (표준) ───────────────────────────────────────────────────────
 
