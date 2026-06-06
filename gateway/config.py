@@ -1400,6 +1400,19 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if hass_url:
             config.platforms[Platform.HOMEASSISTANT].extra["url"] = hass_url
 
+    # Skytower
+    skytower_token = os.getenv("SKYTOWER_TOKEN")
+    skytower_url = os.getenv("SKYTOWER_URL")
+    if skytower_token and skytower_url:
+        _skytower = Platform("skytower")
+        if _skytower not in config.platforms:
+            config.platforms[_skytower] = PlatformConfig()
+        config.platforms[_skytower].enabled = True
+        config.platforms[_skytower].extra.update({
+            "token": skytower_token,
+            "url": skytower_url,
+        })
+
     # Email
     email_addr = os.getenv("EMAIL_ADDRESS")
     email_pwd = os.getenv("EMAIL_PASSWORD")

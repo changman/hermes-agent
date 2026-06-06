@@ -290,6 +290,10 @@ class SkyTowerAdapter(BasePlatformAdapter):
         async def on_request_agent_skills(data: dict):
             await self._handle_agent_skills_request(data)
 
+        @self._sio.on("refresh:agent-commands")
+        async def on_refresh_agent_commands(data: dict):
+            await self._handle_refresh_commands(data)
+
         # ── Soul Sync: SkyTower → SOUL.md ────────────────────────────────────
 
         @self._sio.on("agent:sync-requested")
@@ -585,14 +589,36 @@ class SkyTowerAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[skills] Failed to scan skill commands: %s", e)
             skills = []
+        try:
+            from gateway.commands_parser import get_hermes_commands
+            commands = get_hermes_commands()
+        except Exception as e:
+            logger.warning("[skills] Failed to build commands: %s", e)
+            commands = {}
         await self._sio.emit("agent:skills-response", {
             "requestId": request_id,
             "skills": skills,
+            "commands": commands,
             "metadata": {
                 "agentType": "hermes",
                 "agentName": "Hermes Agent",
                 "version": "1.0.0",
             },
+        })
+
+    async def _handle_refresh_commands(self, data: dict) -> None:
+        """refresh:agent-commands 이벤트 처리. commands 캐시를 무효화합니다."""
+        if not self._sio or not self._sio.connected:
+            return
+        request_id = data.get("requestId", "")
+        try:
+            from gateway.commands_parser import invalidate_commands_cache
+            invalidate_commands_cache()
+        except Exception as e:
+            logger.warning("[skills] Failed to invalidate commands cache: %s", e)
+        await self._sio.emit("refresh:agent-commands-response", {
+            "requestId": request_id,
+            "status": "ok",
         })
 
     # ── Soul Sync ─────────────────────────────────────────────────────────────
