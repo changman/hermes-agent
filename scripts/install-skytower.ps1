@@ -183,6 +183,7 @@ function Install-PluginFiles {
             "plugins/platforms/skytower/soul_sync.py",
             "plugins/platforms/skytower/plugin.yaml",
             "gateway/platforms/skytower_files.py",
+            "gateway/commands_parser.py",
             "hermes_cli/gateway_windows.py",
             "gateway/status.py"
         )

@@ -595,6 +595,11 @@ class SkyTowerAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[skills] Failed to build commands: %s", e)
             commands = {}
+        total_commands = sum(len(v) for v in commands.values()) if commands else 0
+        logger.info(
+            "[skills] skills=%d commands=%d categories=%d",
+            len(skills), total_commands, len(commands),
+        )
         await self._sio.emit("agent:skills-response", {
             "requestId": request_id,
             "skills": skills,
