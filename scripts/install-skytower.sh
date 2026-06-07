@@ -241,10 +241,44 @@ configure_env() {
         fi
     fi
 
-    # 인터랙티브 모드에서 입력 받기
-    if [ -e /dev/tty ]; then
-        if [ -z "$SKYTOWER_TOKEN" ]; then
-            printf "\n${CYAN}→${NC} Skytower 에이전트 토큰 입력 (agentId:rawToken, 없으면 Enter): " > /dev/tty
+    # 인터랙티브 모드에서 토큰 획득 (자동 등록 또는 수동 입력)
+    if [ -e /dev/tty ] && [ -z "$SKYTOWER_TOKEN" ]; then
+        printf "\n${CYAN}  Skytower 에이전트 토큰이 없습니다.${NC}\n" > /dev/tty
+        printf "${CYAN}  Skytower 서버에 새 에이전트를 자동 등록할 수 있습니다.${NC}\n\n" > /dev/tty
+        printf "${CYAN}→${NC} 자동 등록하시겠습니까? (Y/n): " > /dev/tty
+        IFS= read -r _auto_reg < /dev/tty || _auto_reg=""
+        _auto_reg="${_auto_reg:-Y}"
+
+        if [[ "$_auto_reg" =~ ^[Yy]$ ]]; then
+            printf "${CYAN}→${NC} 에이전트 이름 (기본값: My Hermes Agent): " > /dev/tty
+            IFS= read -r _agent_name < /dev/tty || _agent_name=""
+            _agent_name="${_agent_name:-My Hermes Agent}"
+            _agent_name="${_agent_name#"${_agent_name%%[![:space:]]*}"}"
+            [ -z "$_agent_name" ] && _agent_name="My Hermes Agent"
+
+            log_info "Skytower 서버에 에이전트 등록 중: $_agent_name"
+
+            _reg_response=$(curl -fsSL -X POST "$SKYTOWER_URL/api/agents/register" \
+                -H "Content-Type: application/json" \
+                -d "{\"name\":\"$_agent_name\"}" 2>/dev/null) || _reg_response=""
+
+            if [ -z "$_reg_response" ]; then
+                log_error "에이전트 등록 실패 — 서버에 연결할 수 없습니다: $SKYTOWER_URL"
+            else
+                _agent_id=$(printf '%s' "$_reg_response" | grep -o '"agentId":"[^"]*"' | cut -d'"' -f4)
+                _raw_token=$(printf '%s' "$_reg_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+
+                if [ -n "$_agent_id" ] && [ -n "$_raw_token" ]; then
+                    SKYTOWER_TOKEN="$_raw_token"
+                    log_success "에이전트 등록 완료: $_agent_id"
+                    printf "\n${YELLOW}${BOLD}  [!] 토큰은 재발급 불가 — 안전한 곳에 보관하세요:${NC}\n" > /dev/tty
+                    printf "      ${GREEN}${BOLD}%s${NC}\n\n" "$SKYTOWER_TOKEN" > /dev/tty
+                else
+                    log_error "에이전트 등록 응답 파싱 실패: $_reg_response"
+                fi
+            fi
+        else
+            printf "${CYAN}→${NC} Skytower 에이전트 토큰 입력 (agentId:rawToken): " > /dev/tty
             IFS= read -r SKYTOWER_TOKEN < /dev/tty || SKYTOWER_TOKEN=""
             SKYTOWER_TOKEN="${SKYTOWER_TOKEN#"${SKYTOWER_TOKEN%%[![:space:]]*}"}"
         fi
