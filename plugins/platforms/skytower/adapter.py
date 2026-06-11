@@ -135,6 +135,7 @@ class SkyTowerAdapter(BasePlatformAdapter):
 
         self._home_channels: Dict[str, str] = _load_home_channels()
         self._file_handler: Optional[FileAccessHandler] = None
+        self._relay_capabilities: Dict[str, bool] = {}
 
     # ── Per-user home channel ─────────────────────────────────────────────────
 
@@ -164,6 +165,7 @@ class SkyTowerAdapter(BasePlatformAdapter):
         @self._sio.event
         async def connect():
             self._intentional_disconnect = False
+            self._relay_capabilities = {}
             self._mark_connected()
             logger.info(
                 "SkyTower connected: %s (agentId=%s)",
@@ -195,6 +197,14 @@ class SkyTowerAdapter(BasePlatformAdapter):
         @self._sio.on("message")
         async def on_message(data: dict):
             await self._handle_relay_message(data)
+
+        @self._sio.on("relay:capabilities")
+        async def on_relay_capabilities(data: dict):
+            if isinstance(data, dict):
+                self._relay_capabilities = {
+                    str(k): bool(v) for k, v in data.items()
+                }
+                logger.info("SkyTower relay capabilities: %s", self._relay_capabilities)
 
         # ── 파일시스템 접근 이벤트 ───────────────────────────────────────────
 
@@ -538,6 +548,23 @@ class SkyTowerAdapter(BasePlatformAdapter):
 
     # ── Outbound (표준) ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _chat_id_targets(chat_id: str) -> Dict[str, int]:
+        """chat_id(``skytower:agentId:userId[:convId]``)에서 relay 타겟 필드를 추출한다."""
+        parts = chat_id.split(":")
+        try:
+            user_id         = int(parts[2]) if len(parts) > 2 else None
+            conversation_id = int(parts[3]) if len(parts) > 3 else None
+        except (ValueError, IndexError):
+            user_id = conversation_id = None
+
+        targets: Dict[str, int] = {}
+        if conversation_id:
+            targets["target_conversation_id"] = conversation_id
+        elif user_id:
+            targets["target_user_id"] = user_id
+        return targets
+
     async def send(
         self,
         chat_id: str,
@@ -548,27 +575,62 @@ class SkyTowerAdapter(BasePlatformAdapter):
         if not self._sio or not self._sio.connected:
             return SendResult(success=False, error="Not connected to Skytower Relay")
 
-        parts = chat_id.split(":")
-        try:
-            user_id         = int(parts[2]) if len(parts) > 2 else None
-            conversation_id = int(parts[3]) if len(parts) > 3 else None
-        except (ValueError, IndexError):
-            user_id = conversation_id = None
-
         payload: Dict[str, Any] = {"content": content, "type": "text"}
-        if conversation_id:
-            payload["target_conversation_id"] = conversation_id
-        elif user_id:
-            payload["target_user_id"] = user_id
+        payload.update(self._chat_id_targets(chat_id))
 
         try:
+            if self._relay_capabilities.get("message_ack"):
+                ack = await self._sio.call("message_done", payload, timeout=8)
+                message_id = None
+                if isinstance(ack, dict):
+                    message_id = ack.get("message_id") or ack.get("id")
+                return SendResult(
+                    success=True,
+                    message_id=str(message_id) if message_id else None,
+                )
+
             await self._sio.emit("message_done", payload)
             return SendResult(success=True)
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        if not self._relay_capabilities.get("edit_message"):
+            return await super().edit_message(chat_id, message_id, content, finalize=finalize)
+
+        if not self._sio or not self._sio.connected:
+            return SendResult(success=False, error="Not connected to Skytower Relay")
+
+        payload: Dict[str, Any] = {
+            "message_id": message_id,
+            "content": content,
+            "finalize": finalize,
+        }
+        payload.update(self._chat_id_targets(chat_id))
+
+        try:
+            ack = await self._sio.call("message_edit", payload, timeout=8)
+            success = ack.get("success", True) if isinstance(ack, dict) else True
+            return SendResult(success=bool(success), message_id=message_id)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        pass
+        if not self._relay_capabilities.get("typing"):
+            return
+        if not self._sio or not self._sio.connected:
+            return
+        try:
+            await self._sio.emit("typing", self._chat_id_targets(chat_id))
+        except Exception:
+            pass
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         parts   = chat_id.split(":")
