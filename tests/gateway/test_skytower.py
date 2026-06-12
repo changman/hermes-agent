@@ -17,7 +17,7 @@ def _make_config(**extra):
 
 
 def _make_adapter(**extra):
-    from gateway.platforms.skytower import SkyTowerAdapter
+    from plugins.platforms.skytower.adapter import SkyTowerAdapter
     return SkyTowerAdapter(_make_config(**extra))
 
 
@@ -33,8 +33,8 @@ class TestSkyTowerConfig:
 
         config = GatewayConfig()
         _apply_env_overrides(config)
-        assert Platform.SKYTOWER in config.platforms
-        sc = config.platforms[Platform.SKYTOWER]
+        assert Platform("skytower") in config.platforms
+        sc = config.platforms[Platform("skytower")]
         assert sc.enabled is True
         assert sc.extra["token"] == "agentX:rawT0ken"
         assert sc.extra["url"] == "http://localhost:4000"
@@ -47,7 +47,7 @@ class TestSkyTowerConfig:
         config = GatewayConfig()
         _apply_env_overrides(config)
         # Platform should not appear in connected_platforms without both vars
-        assert Platform.SKYTOWER not in config.get_connected_platforms()
+        assert Platform("skytower") not in config.get_connected_platforms()
 
     def test_not_connected_without_token(self, monkeypatch):
         monkeypatch.delenv("SKYTOWER_TOKEN", raising=False)
@@ -56,7 +56,7 @@ class TestSkyTowerConfig:
 
         config = GatewayConfig()
         _apply_env_overrides(config)
-        assert Platform.SKYTOWER not in config.get_connected_platforms()
+        assert Platform("skytower") not in config.get_connected_platforms()
 
 
 # ---------------------------------------------------------------------------
@@ -77,12 +77,12 @@ class TestSkyTowerAdapterInit:
         assert adapter._relay_url == "http://localhost:4000"
 
     def test_invalid_token_raises(self):
-        from gateway.platforms.skytower import SkyTowerAdapter
+        from plugins.platforms.skytower.adapter import SkyTowerAdapter
         with pytest.raises(ValueError, match="agentId:rawToken"):
             SkyTowerAdapter(PlatformConfig(enabled=True, extra={"token": "badtoken", "url": "http://x"}))
 
     def test_missing_token_raises(self):
-        from gateway.platforms.skytower import SkyTowerAdapter
+        from plugins.platforms.skytower.adapter import SkyTowerAdapter
         with pytest.raises(ValueError):
             SkyTowerAdapter(PlatformConfig(enabled=True, extra={"url": "http://x"}))
 
@@ -293,18 +293,45 @@ class TestGetChatInfo:
 
 
 # ---------------------------------------------------------------------------
+# YAML config bridging (channel_skill_bindings / default_skill / channel_names)
+# ---------------------------------------------------------------------------
+
+class TestApplyYamlConfig:
+    def test_seeds_known_keys(self):
+        from plugins.platforms.skytower.adapter import _apply_yaml_config
+
+        seeded = _apply_yaml_config({}, {
+            "token": "a:b",
+            "url": "http://x",
+            "default_skill": "my-skill",
+            "channel_skill_bindings": [{"id": "42", "skill": "coding-assistant"}],
+            "channel_names": {"42": "코딩 채널"},
+        })
+        assert seeded == {
+            "default_skill": "my-skill",
+            "channel_skill_bindings": [{"id": "42", "skill": "coding-assistant"}],
+            "channel_names": {"42": "코딩 채널"},
+        }
+
+    def test_returns_none_when_no_relevant_keys(self):
+        from plugins.platforms.skytower.adapter import _apply_yaml_config
+
+        assert _apply_yaml_config({}, {"token": "a:b", "url": "http://x"}) is None
+
+
+# ---------------------------------------------------------------------------
 # check_skytower_requirements
 # ---------------------------------------------------------------------------
 
 class TestRequirementsCheck:
     def test_returns_true_when_socketio_available(self):
-        from gateway.platforms.skytower import check_skytower_requirements
+        from plugins.platforms.skytower.adapter import check_skytower_requirements
         with patch.dict("sys.modules", {"socketio": MagicMock()}):
             assert check_skytower_requirements() is True
 
     def test_returns_false_when_socketio_missing(self):
         import sys
-        from gateway.platforms.skytower import check_skytower_requirements
+        from plugins.platforms.skytower.adapter import check_skytower_requirements
         original = sys.modules.pop("socketio", None)
         try:
             assert check_skytower_requirements() is False

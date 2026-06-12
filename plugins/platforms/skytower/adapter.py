@@ -111,6 +111,29 @@ def _env_enablement_fn() -> Optional[Dict[str, Any]]:
     return None
 
 
+def _apply_yaml_config(yaml_cfg: dict, skytower_cfg: dict) -> Optional[dict]:
+    """Seed ``PlatformConfig.extra`` from ``platforms.skytower`` YAML keys.
+
+    Implements the ``apply_yaml_config_fn`` contract (#24836).
+
+    The shared YAML→extra bridging loop in ``load_gateway_config()`` only
+    forwards ``channel_skill_bindings`` for Discord/Slack, and has no entry
+    at all for ``default_skill`` / ``channel_names`` — both of which the
+    Skytower adapter reads from ``config.extra`` (see module docstring for
+    the documented config.yaml shape). Without this hook those settings are
+    silently dropped and channel-skill bindings, the default skill, and
+    channel display names never reach the adapter.
+    """
+    seeded: Dict[str, Any] = {}
+    if "channel_skill_bindings" in skytower_cfg:
+        seeded["channel_skill_bindings"] = skytower_cfg["channel_skill_bindings"]
+    if "default_skill" in skytower_cfg:
+        seeded["default_skill"] = skytower_cfg["default_skill"]
+    if "channel_names" in skytower_cfg:
+        seeded["channel_names"] = skytower_cfg["channel_names"]
+    return seeded or None
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -578,6 +601,11 @@ class SkyTowerAdapter(BasePlatformAdapter):
         payload: Dict[str, Any] = {"content": content, "type": "text"}
         payload.update(self._chat_id_targets(chat_id))
 
+        logger.info(
+            "[REASONING_DEBUG] adapter.send -> message_done content_head=%r",
+            content[:120],
+        )
+
         try:
             if self._relay_capabilities.get("message_ack"):
                 ack = await self._sio.call("message_done", payload, timeout=8)
@@ -614,6 +642,11 @@ class SkyTowerAdapter(BasePlatformAdapter):
             "finalize": finalize,
         }
         payload.update(self._chat_id_targets(chat_id))
+
+        logger.info(
+            "[REASONING_DEBUG] adapter.edit_message -> message_edit content_head=%r finalize=%s",
+            content[:120], finalize,
+        )
 
         try:
             ack = await self._sio.call("message_edit", payload, timeout=8)
@@ -739,6 +772,7 @@ def register(ctx) -> None:
         check_fn=check_skytower_requirements,
         is_connected=_is_connected,
         env_enablement_fn=_env_enablement_fn,
+        apply_yaml_config_fn=_apply_yaml_config,
         required_env=["SKYTOWER_TOKEN", "SKYTOWER_URL"],
         install_hint="pip install 'python-socketio[asyncio_client]' psutil",
         allowed_users_env="SKYTOWER_ALLOWED_USERS",
