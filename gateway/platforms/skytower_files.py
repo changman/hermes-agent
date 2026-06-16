@@ -6,6 +6,7 @@ file:* 이벤트를 처리합니다.
 지원 이벤트 (Relay → Agent):
   file:list          — 디렉토리 목록
   file:read          — 파일 내용 읽기 (텍스트 or base64)
+  file:write         — 파일 내용 저장 (UTF-8 텍스트)
   file:download      — 대용량 파일 청크 스트리밍 다운로드
   file:upload_start  — 업로드 세션 시작
   file:upload_chunk  — 업로드 청크 수신 (마지막 청크에서 파일 저장)
@@ -14,6 +15,7 @@ file:* 이벤트를 처리합니다.
 지원 이벤트 (Agent → Relay):
   file:list_result
   file:read_result
+  file:write_result
   file:chunk                — 다운로드 청크 스트리밍
   file:download_error
   file:upload_start_result
@@ -47,9 +49,10 @@ logger = logging.getLogger(__name__)
 # 상수
 # ---------------------------------------------------------------------------
 
-_MAX_READ_CHARS  = 100_000          # 텍스트 파일 최대 반환 크기 (chars)
-_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 업로드 한 파일 최대 크기 (100 MB)
-_CHUNK_SIZE       = 256 * 1024         # 다운로드 청크 크기 (256 KB)
+_MAX_READ_CHARS   = 100_000              # 텍스트 파일 최대 반환 크기 (chars)
+_MAX_WRITE_CHARS  = 10 * 1024 * 1024    # 쓰기 파일 최대 크기 (10 MB chars)
+_MAX_UPLOAD_BYTES = 100 * 1024 * 1024   # 업로드 한 파일 최대 크기 (100 MB)
+_CHUNK_SIZE       = 256 * 1024          # 다운로드 청크 크기 (256 KB)
 
 # 읽기/목록 조회가 차단되는 민감 경로 접두어
 _BLOCKED_READ_PREFIXES: tuple[str, ...] = (
@@ -269,8 +272,8 @@ class FileAccessHandler:
         request_id = data.get("request_id", "")
         raw_path   = data.get("path", "~")
         conv_id    = data.get("conv_id")
-        logger.debug("file:list received — request_id=%s path=%s conv_id=%s",
-                     request_id, raw_path, conv_id)
+        logger.info("file:list received — request_id=%s raw_path=%r conv_id=%s",
+                    request_id, raw_path, conv_id)
 
         async def _err(msg: str) -> None:
             await self._emit("file:list_result", {"request_id": request_id, "error": msg})
@@ -429,6 +432,67 @@ class FileAccessHandler:
             "truncated":   truncated,
             "is_binary":   False,
         })
+
+    # ── file:write ────────────────────────────────────────────────────────────
+
+    async def handle_write(self, data: dict) -> None:
+        """
+        파일을 지정된 경로에 UTF-8 텍스트로 저장합니다.
+        부모 디렉토리가 없으면 자동으로 생성합니다.
+
+        data: { request_id: str, path: str, content: str }
+        emit: file:write_result { request_id, success: True }
+              | { request_id, error: str }
+        """
+        request_id = data.get("request_id", "")
+        raw_path   = data.get("path", "")
+        content    = data.get("content", "")
+
+        async def _err(msg: str) -> None:
+            await self._emit("file:write_result",
+                             {"request_id": request_id, "error": msg})
+
+        if not raw_path:
+            await _err("path is required")
+            return
+
+        if not isinstance(content, str):
+            await _err("content must be a string")
+            return
+
+        logger.info("file:write received — request_id=%s raw_path=%r size=%d chars",
+                    request_id, raw_path, len(content))
+
+        if len(content) > _MAX_WRITE_CHARS:
+            await _err(
+                f"File too large: {len(content):,} chars "
+                f"(max {_MAX_WRITE_CHARS // (1024 * 1024)} MB)"
+            )
+            return
+
+        try:
+            resolved = _resolve(raw_path)
+        except Exception as e:
+            await _err(f"Invalid path: {e}")
+            return
+
+        if is_write_denied(str(resolved)):
+            await _err(f"Write denied: {resolved}")
+            return
+
+        try:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(content, encoding="utf-8")
+        except PermissionError as e:
+            await _err(f"Permission denied: {e}")
+            return
+        except OSError as e:
+            await _err(str(e))
+            return
+
+        logger.info("file:write — %s (%d chars)", resolved, len(content))
+        await self._emit("file:write_result",
+                         {"request_id": request_id, "success": True})
 
     # ── file:download ─────────────────────────────────────────────────────────
 

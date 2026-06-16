@@ -265,6 +265,13 @@ class SkyTowerAdapter(BasePlatformAdapter):
             except Exception:
                 logger.exception("file:upload_chunk handler error — data=%s", data)
 
+        @self._sio.on("file:write")
+        async def on_file_write(data: dict):
+            try:
+                await self._file_handler.handle_write(data)
+            except Exception:
+                logger.exception("file:write handler error — data=%s", data)
+
         @self._sio.on("file:delete")
         async def on_file_delete(data: dict):
             try:
