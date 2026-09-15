@@ -1,0 +1,882 @@
+"""Skytower Relay platform adapter.
+
+Connects Hermes to the Skytower Relay Server via Socket.IO.
+
+Authentication: agentId:rawToken (issued by Relay Server /api/agents/register)
+Protocol: Socket.IO (WebSocket with polling fallback)
+
+Per-user Home Channel
+---------------------
+각 유저가 /sethome 명령으로 자신의 홈 채널을 지정합니다.
+설정은 ~/.hermes/skytower_home_channels.json 에 유저별로 저장됩니다.
+
+Skill Bindings
+--------------
+config.yaml에서 채널(conversation_id)별로 스킬을 자동 바인딩할 수 있습니다.
+새 세션 시작 시 SKILL.md 전문이 자동으로 주입됩니다.
+
+예시 (config.yaml):
+  platforms:
+    skytower:
+      token: "agentId:rawToken"
+      url: "https://relay.example.com"
+      default_skill: "my-skill"          # 모든 대화의 기본 스킬
+      channel_skill_bindings:            # 대화방별 스킬 바인딩
+        - id: "42"                       # conversation_id
+          skill: "coding-assistant"
+        - id: "99"
+          skills: ["research", "writer"] # 복수 스킬
+      channel_prompts:                   # 대화방별 ephemeral 시스템 프롬프트
+        "42": "You are a senior backend engineer."
+      channel_names:                     # 대화방 표시명 (session context용)
+        "42": "코딩 채널"
+"""
+
+import asyncio
+import base64
+import json
+import logging
+import os
+import sys
+from pathlib import Path as _Path
+from typing import Any, Dict, List, Optional
+
+# Ensure the repo root is importable when this plugin runs standalone
+sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    cache_image_from_bytes,
+)
+from gateway.platforms.skytower_files import FileAccessHandler
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_reply_to(data: dict) -> tuple[Optional[str], Optional[str]]:
+    """relay payload의 ``reply_to`` 요약에서 (message_id, text)를 꺼낸다.
+
+    Relay 서버는 사용자가 특정 메시지에 답글을 달면
+    ``reply_to: {id, direction, type, user_name, content}`` 를 동봉한다.
+    gateway는 MessageEvent.reply_to_message_id / reply_to_text 가 채워지면
+    프롬프트 앞에 ``[Replying to: "..."]`` 를 주입한다.
+    """
+    ref = data.get("reply_to")
+    if not isinstance(ref, dict):
+        return None, None
+    ref_id = ref.get("id")
+    if ref_id in (None, ""):
+        return None, None
+    return str(ref_id), (ref.get("content") or "")
+
+
+def _reply_to_id(reply_to: Optional[str]) -> Optional[int]:
+    """send(reply_to=...) 로 넘어온 사용자 메시지 id를 relay의 정수 id로 변환한다."""
+    if reply_to in (None, ""):
+        return None
+    try:
+        return int(reply_to)
+    except (TypeError, ValueError):
+        return None
+
+_HOME_CHANNELS_FILE = "skytower_home_channels.json"
+
+
+# ---------------------------------------------------------------------------
+# Per-user home channel persistence
+# ---------------------------------------------------------------------------
+
+def _home_channels_path() -> _Path:
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / _HOME_CHANNELS_FILE
+
+
+def _load_home_channels() -> Dict[str, str]:
+    try:
+        return json.loads(_home_channels_path().read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_home_channels(mapping: Dict[str, str]) -> None:
+    try:
+        _home_channels_path().write_text(
+            json.dumps(mapping, ensure_ascii=False, indent=2)
+        )
+    except OSError as e:
+        logger.warning("Failed to save home channels: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Requirements check
+# ---------------------------------------------------------------------------
+
+def check_skytower_requirements() -> bool:
+    try:
+        import socketio  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _is_connected(cfg: PlatformConfig) -> bool:
+    token = cfg.extra.get("token") or os.getenv("SKYTOWER_TOKEN", "")
+    url = cfg.extra.get("url") or os.getenv("SKYTOWER_URL", "")
+    return bool(token and url)
+
+
+def _env_enablement_fn() -> Optional[Dict[str, Any]]:
+    """Seed PlatformConfig.extra from env vars so the gateway can auto-enable."""
+    token = os.getenv("SKYTOWER_TOKEN", "")
+    url = os.getenv("SKYTOWER_URL", "")
+    if token and url:
+        return {"token": token, "url": url}
+    return None
+
+
+def _apply_yaml_config(yaml_cfg: dict, skytower_cfg: dict) -> Optional[dict]:
+    """Seed ``PlatformConfig.extra`` from ``platforms.skytower`` YAML keys.
+
+    Implements the ``apply_yaml_config_fn`` contract (#24836).
+
+    The shared YAML→extra bridging loop in ``load_gateway_config()`` only
+    forwards ``channel_skill_bindings`` for Discord/Slack, and has no entry
+    at all for ``default_skill`` / ``channel_names`` — both of which the
+    Skytower adapter reads from ``config.extra`` (see module docstring for
+    the documented config.yaml shape). Without this hook those settings are
+    silently dropped and channel-skill bindings, the default skill, and
+    channel display names never reach the adapter.
+    """
+    seeded: Dict[str, Any] = {}
+    if "channel_skill_bindings" in skytower_cfg:
+        seeded["channel_skill_bindings"] = skytower_cfg["channel_skill_bindings"]
+    if "default_skill" in skytower_cfg:
+        seeded["default_skill"] = skytower_cfg["default_skill"]
+    if "channel_names" in skytower_cfg:
+        seeded["channel_names"] = skytower_cfg["channel_names"]
+    return seeded or None
+
+
+# ---------------------------------------------------------------------------
+# Adapter
+# ---------------------------------------------------------------------------
+
+class SkyTowerAdapter(BasePlatformAdapter):
+    """Hermes platform adapter for Skytower Relay Server."""
+
+    def __init__(self, config: PlatformConfig):
+        super().__init__(config, Platform("skytower"))
+        extra = config.extra or {}
+
+        raw_token = extra.get("token") or os.getenv("SKYTOWER_TOKEN", "")
+        if not raw_token or ":" not in raw_token:
+            raise ValueError("SKYTOWER_TOKEN must be in 'agentId:rawToken' format")
+
+        self._agent_id, _ = raw_token.split(":", 1)
+        self._token = raw_token
+        self._relay_url = extra.get("url") or os.getenv("SKYTOWER_URL", "")
+        self._sio: Optional[Any] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._intentional_disconnect: bool = False
+
+        self._home_channels: Dict[str, str] = _load_home_channels()
+        self._file_handler: Optional[FileAccessHandler] = None
+        self._relay_capabilities: Dict[str, bool] = {}
+
+    # ── Per-user home channel ─────────────────────────────────────────────────
+
+    def _get_user_home_conv(self, user_id: str) -> Optional[str]:
+        return self._home_channels.get(user_id)
+
+    def _set_user_home_conv(self, user_id: str, conv_id: str) -> None:
+        self._home_channels[user_id] = conv_id
+        _save_home_channels(self._home_channels)
+        logger.info("Home channel set: user=%s → conv=%s", user_id, conv_id)
+
+    # ── Connection ────────────────────────────────────────────────────────────
+
+    async def connect(self) -> bool:
+        if not self._relay_url:
+            logger.error("SKYTOWER_URL is not set")
+            return False
+
+        import socketio
+
+        self._sio = socketio.AsyncClient(
+            reconnection=True,
+            reconnection_delay=2,
+            reconnection_delay_max=30,
+        )
+        self._wire_plugin_handlers(self._sio)  # plugin-registered native handlers
+
+        @self._sio.event
+        async def connect():
+            self._intentional_disconnect = False
+            self._relay_capabilities = {}
+            self._mark_connected()
+            logger.info(
+                "SkyTower connected: %s (agentId=%s)",
+                self._relay_url, self._agent_id,
+            )
+            await self._sio.emit("heartbeat", self._collect_metrics())
+            if self._heartbeat_task is None or self._heartbeat_task.done():
+                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            if os.getenv("SKYTOWER_PRINT_PAIR_CODE", "").lower() in ("1", "true", "yes"):
+                await self._print_pairing_code()
+
+        @self._sio.event
+        async def disconnect():
+            self._mark_disconnected()
+            logger.warning("SkyTower disconnected")
+
+        @self._sio.on("__disconnect_final")
+        async def on_disconnect_final():
+            if self._intentional_disconnect:
+                return
+            logger.warning(
+                "SkyTower: socket.io gave up reconnecting — triggering gateway-level reconnect"
+            )
+            self._set_fatal_error(
+                "disconnected", "SkyTower server disconnected", retryable=True
+            )
+            await self._notify_fatal_error()
+
+        @self._sio.on("message")
+        async def on_message(data: dict):
+            await self._handle_relay_message(data)
+
+        @self._sio.on("relay:capabilities")
+        async def on_relay_capabilities(data: dict):
+            if isinstance(data, dict):
+                self._relay_capabilities = {
+                    str(k): bool(v) for k, v in data.items()
+                }
+                logger.info("SkyTower relay capabilities: %s", self._relay_capabilities)
+
+        # ── 파일시스템 접근 이벤트 ───────────────────────────────────────────
+
+        self._file_handler = FileAccessHandler(self._sio)
+
+        @self._sio.on("file:list")
+        async def on_file_list(data: dict):
+            try:
+                await self._file_handler.handle_list(data)
+            except Exception:
+                logger.exception("file:list handler error — data=%s", data)
+
+        @self._sio.on("file:read")
+        async def on_file_read(data: dict):
+            try:
+                await self._file_handler.handle_read(data)
+            except Exception:
+                logger.exception("file:read handler error — data=%s", data)
+
+        @self._sio.on("file:download")
+        async def on_file_download(data: dict):
+            asyncio.create_task(self._file_handler.handle_download(data))
+
+        @self._sio.on("file:upload_start")
+        async def on_file_upload_start(data: dict):
+            try:
+                await self._file_handler.handle_upload_start(data)
+            except Exception:
+                logger.exception("file:upload_start handler error — data=%s", data)
+
+        @self._sio.on("file:upload_chunk")
+        async def on_file_upload_chunk(data: dict):
+            try:
+                await self._file_handler.handle_upload_chunk(data)
+            except Exception:
+                logger.exception("file:upload_chunk handler error — data=%s", data)
+
+        @self._sio.on("file:write")
+        async def on_file_write(data: dict):
+            try:
+                await self._file_handler.handle_write(data)
+            except Exception:
+                logger.exception("file:write handler error — data=%s", data)
+
+        @self._sio.on("file:delete")
+        async def on_file_delete(data: dict):
+            try:
+                await self._file_handler.handle_delete(data)
+            except Exception:
+                logger.exception("file:delete handler error — data=%s", data)
+
+        # ── 스킬 조회 이벤트 ──────────────────────────────────────────────────
+
+        @self._sio.on("request:agent-skills")
+        async def on_request_agent_skills(data: dict):
+            await self._handle_agent_skills_request(data)
+
+        try:
+            await self._sio.connect(
+                self._relay_url,
+                auth={"token": self._token},
+                transports=["websocket", "polling"],
+                wait_timeout=10,
+            )
+        except Exception as e:
+            logger.error("SkyTower connect error: %s", e)
+            return False
+
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        return True
+
+    async def disconnect(self) -> None:
+        self._intentional_disconnect = True
+        self._running = False
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+        if self._sio:
+            await self._sio.disconnect()
+        self._mark_disconnected()
+
+    # ── Inbound routing ───────────────────────────────────────────────────────
+
+    async def _handle_relay_message(self, data: dict) -> None:
+        logger.debug("on_message received: direction=%r type=%r user_id=%r content=%r",
+                     data.get("direction"), data.get("type"),
+                     data.get("user_id"), str(data.get("content", ""))[:80])
+        if data.get("direction") != "outbound":
+            logger.warning("on_message dropped: direction=%r (expected 'outbound')", data.get("direction"))
+            return
+
+        msg_type = data.get("type", "text")
+        file_content = data.get("file_content")
+
+        if msg_type != "text" and not file_content:
+            logger.warning("on_message dropped: type=%r with no file_content", msg_type)
+            return
+
+        user_id = data.get("user_id")
+        if not user_id:
+            logger.warning("on_message dropped: user_id missing")
+            return
+
+        user_str  = str(user_id)
+        conv_str  = str(data["conversation_id"]) if data.get("conversation_id") else None
+        user_name = data.get("user_name") or f"User {user_id}"
+        content   = (data.get("content") or "").strip()
+
+        if content == "/chatid":
+            await self._handle_chatid(user_str, conv_str)
+            return
+
+        if content == "/sethome":
+            if conv_str:
+                await self._handle_sethome(user_str, conv_str)
+            else:
+                await self._reply_user(user_str, conv_str,
+                    "❌ `/sethome`은 대화방 안에서만 사용할 수 있습니다.")
+            return
+
+        if content in ("/skills", "/skill-list"):
+            await self._handle_skills_command(user_str, conv_str)
+            return
+
+        # ── file_content 처리 ─────────────────────────────────────────────────
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        message_type = MessageType.TEXT
+
+        if file_content:
+            content, media_urls, media_types, message_type = self._process_file_content(
+                content, file_content, data
+            )
+
+        chat_id = (
+            f"skytower:{self._agent_id}:{user_str}:{conv_str}"
+            if conv_str
+            else f"skytower:{self._agent_id}:{user_str}"
+        )
+
+        # ── 채널별 스킬 바인딩 & 프롬프트 해석 ──────────────────────────────
+        from gateway.platforms.base import resolve_channel_skills, resolve_channel_prompt
+        extra = self.config.extra or {}
+
+        _lookup_id  = conv_str or user_str
+        _parent_id  = user_str if conv_str else None
+
+        auto_skill = resolve_channel_skills(extra, _lookup_id, _parent_id)
+        if auto_skill is None:
+            _default = (extra.get("default_skill") or "").strip()
+            if _default:
+                auto_skill = [_default]
+
+        channel_prompt = resolve_channel_prompt(extra, _lookup_id, _parent_id)
+
+        channel_names: dict = extra.get("channel_names") or {}
+        chat_topic: str | None = None
+        if conv_str:
+            chat_topic = channel_names.get(conv_str) or None
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=user_name,
+            chat_type="dm",
+            user_id=user_str,
+            user_name=user_name,
+            chat_topic=chat_topic,
+        )
+        reply_to_message_id, reply_to_text = _extract_reply_to(data)
+        await self.handle_message(MessageEvent(
+            text=content,
+            message_type=message_type,
+            source=source,
+            message_id=str(data.get("id", "")),
+            auto_skill=auto_skill,
+            channel_prompt=channel_prompt,
+            media_urls=media_urls,
+            media_types=media_types,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_text=reply_to_text,
+        ))
+
+    def _process_file_content(
+        self,
+        content: str,
+        file_content: Dict[str, Any],
+        data: Dict[str, Any],
+    ) -> tuple:
+        """file_content 필드를 처리하여 (content, media_urls, media_types, message_type)을 반환합니다."""
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        message_type = MessageType.TEXT
+        fc_type = file_content.get("type")
+
+        if fc_type == "image":
+            mime = file_content.get("mimeType", "image/jpeg")
+            raw_subtype = mime.split("/")[-1].lower() if "/" in mime else "jpeg"
+            _ext_map = {"jpeg": ".jpg", "jpg": ".jpg", "png": ".png",
+                        "gif": ".gif", "webp": ".webp", "bmp": ".bmp"}
+            ext = _ext_map.get(raw_subtype, f".{raw_subtype}")
+            try:
+                raw_bytes = base64.b64decode(file_content["data"])
+                cached_path = cache_image_from_bytes(raw_bytes, ext)
+                media_urls.append(cached_path)
+                media_types.append(mime)
+                message_type = MessageType.PHOTO
+                logger.info("file_content image cached: %s (%d bytes)", cached_path, len(raw_bytes))
+            except Exception as e:
+                logger.warning("Failed to cache file_content image: %s", e)
+                file_name = data.get("file_name", "image")
+                content = (content + f"\n\n[첨부 이미지: {file_name} — 처리 실패: {e}]").strip()
+
+        elif fc_type == "text":
+            text_data = file_content.get("data", "")
+            file_name = data.get("file_name", "unnamed")
+            truncated = file_content.get("truncated", False)
+            truncation_note = " (처음 100KB만 표시)" if truncated else ""
+            content = (
+                content
+                + f"\n\n[첨부 파일: {file_name}{truncation_note}]\n```\n{text_data}\n```"
+            ).strip()
+
+        elif fc_type == "file":
+            size_bytes = file_content.get("size", 0)
+            mime = file_content.get("mimeType", "unknown")
+            file_name = data.get("file_name", "N/A")
+            file_path = data.get("file_path", "N/A")
+            size_kb = size_bytes / 1024
+            content = (
+                content
+                + f"\n\n[첨부 파일]\n- 이름: {file_name}\n- 타입: {mime}"
+                f"\n- 크기: {size_kb:.1f}KB\n- 경로: {file_path}"
+            ).strip()
+
+        else:
+            logger.warning("Unknown file_content type: %r", fc_type)
+
+        return content, media_urls, media_types, message_type
+
+    # ── 메시지 전송 헬퍼 ──────────────────────────────────────────────────────
+
+    async def _reply_user(
+        self, user_id: str, conv_id: Optional[str], text: str
+    ) -> None:
+        if not self._sio or not self._sio.connected:
+            return
+        payload: Dict[str, Any] = {"content": text, "type": "text"}
+        if conv_id:
+            payload["target_conversation_id"] = int(conv_id)
+        else:
+            payload["target_user_id"] = int(user_id)
+        await self._sio.emit("message_done", payload)
+
+    async def _reply_conv(self, conv_id: str, text: str) -> None:
+        if self._sio and self._sio.connected:
+            await self._sio.emit("message_done", {
+                "content": text,
+                "type": "text",
+                "target_conversation_id": int(conv_id),
+            })
+
+    # ── /chatid ───────────────────────────────────────────────────────────────
+
+    async def _handle_chatid(self, user_id: str, conv_id: Optional[str]) -> None:
+        if conv_id:
+            jid = f"skytower:{self._agent_id}:{user_id}:{conv_id}"
+        else:
+            jid = f"skytower:{self._agent_id}:{user_id}"
+
+        text = (
+            f"**현재 채팅방 JID**\n"
+            f"`{jid}`\n\n"
+            f"• Agent ID: `{self._agent_id}`\n"
+            f"• User ID: `{user_id}`\n"
+            f"• Conversation ID: `{conv_id or '없음'}`"
+        )
+
+        if self._sio and self._sio.connected:
+            payload: Dict[str, Any] = {"content": text, "type": "text"}
+            if conv_id:
+                payload["target_conversation_id"] = int(conv_id)
+            else:
+                payload["target_user_id"] = int(user_id)
+            await self._sio.emit("message_done", payload)
+
+    # ── /skills ───────────────────────────────────────────────────────────────
+
+    async def _handle_skills_command(self, user_id: str, conv_id: Optional[str]) -> None:
+        try:
+            from agent.skill_commands import scan_skill_commands
+            skill_cmds = scan_skill_commands()
+
+            if not skill_cmds:
+                text = "📦 설치된 스킬이 없습니다.\n`hermes skills install <skill-name>`으로 스킬을 설치하세요."
+            else:
+                lines = ["**🧩 사용 가능한 스킬 목록**\n"]
+                for cmd_key, info in sorted(skill_cmds.items()):
+                    name = info.get("name", cmd_key.lstrip("/"))
+                    desc = info.get("description", "")
+                    slug = cmd_key.lstrip("/")
+                    if desc:
+                        lines.append(f"• `/{slug}` — {desc}")
+                    else:
+                        lines.append(f"• `/{slug}`")
+                lines.append(f"\n총 **{len(skill_cmds)}개** 스킬 설치됨")
+                lines.append("스킬을 사용하려면 `/skill-name` 형식으로 입력하세요.")
+                text = "\n".join(lines)
+        except Exception as e:
+            logger.warning("Failed to list skills: %s", e)
+            text = "⚠️ 스킬 목록을 불러오는 중 오류가 발생했습니다."
+
+        await self._reply_user(user_id, conv_id, text)
+
+    # ── /sethome ──────────────────────────────────────────────────────────────
+
+    async def _handle_sethome(self, user_id: str, conv_id: str) -> None:
+        prev = self._get_user_home_conv(user_id)
+        self._set_user_home_conv(user_id, conv_id)
+
+        msg = "✅ 이 대화가 홈 채널로 설정됐습니다."
+        if prev and prev != conv_id:
+            msg += f"\n이전 홈 채널: Conv #{prev}"
+
+        await self._reply_conv(conv_id, msg)
+
+    # ── request:agent-skills ─────────────────────────────────────────────────
+
+    async def _handle_agent_skills_request(self, data: dict) -> None:
+        if not self._sio or not self._sio.connected:
+            return
+        request_id = data.get("requestId", "")
+        logger.info("[skills] Responding to skills request: %s", request_id)
+        try:
+            from agent.skill_commands import scan_skill_commands
+            skill_cmds = scan_skill_commands()
+            skills = [
+                {"command": cmd, "description": info.get("description", "")}
+                for cmd, info in sorted(skill_cmds.items())
+            ]
+        except Exception as e:
+            logger.warning("[skills] Failed to scan skill commands: %s", e)
+            skills = []
+        await self._sio.emit("agent:skills-response", {
+            "requestId": request_id,
+            "skills": skills,
+            "metadata": {
+                "agentType": "hermes",
+                "agentName": "Hermes Agent",
+                "version": "1.0.0",
+            },
+        })
+
+    # ── Outbound (표준) ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _chat_id_targets(chat_id: str) -> Dict[str, int]:
+        """chat_id(``skytower:agentId:userId[:convId]``)에서 relay 타겟 필드를 추출한다."""
+        parts = chat_id.split(":")
+        try:
+            user_id         = int(parts[2]) if len(parts) > 2 else None
+            conversation_id = int(parts[3]) if len(parts) > 3 else None
+        except (ValueError, IndexError):
+            user_id = conversation_id = None
+
+        targets: Dict[str, int] = {}
+        if conversation_id:
+            targets["target_conversation_id"] = conversation_id
+        elif user_id:
+            targets["target_user_id"] = user_id
+        return targets
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if not self._sio or not self._sio.connected:
+            return SendResult(success=False, error="Not connected to Skytower Relay")
+
+        payload: Dict[str, Any] = {"content": content, "type": "text"}
+        payload.update(self._chat_id_targets(chat_id))
+        # 어떤 사용자 메시지에 대한 답인지 relay에 남긴다 (message.reply_to_id)
+        rid = _reply_to_id(reply_to)
+        if rid is not None:
+            payload["reply_to_id"] = rid
+
+        logger.info(
+            "[REASONING_DEBUG] adapter.send -> message_done content_head=%r",
+            content[:120],
+        )
+
+        try:
+            if self._relay_capabilities.get("message_ack"):
+                ack = await self._sio.call("message_done", payload, timeout=8)
+                message_id = None
+                if isinstance(ack, dict):
+                    message_id = ack.get("message_id") or ack.get("id")
+                return SendResult(
+                    success=True,
+                    message_id=str(message_id) if message_id else None,
+                )
+
+            await self._sio.emit("message_done", payload)
+            return SendResult(success=True)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        if not self._relay_capabilities.get("edit_message"):
+            return await super().edit_message(chat_id, message_id, content, finalize=finalize)
+
+        if not self._sio or not self._sio.connected:
+            return SendResult(success=False, error="Not connected to Skytower Relay")
+
+        payload: Dict[str, Any] = {
+            "message_id": message_id,
+            "content": content,
+            "finalize": finalize,
+        }
+        payload.update(self._chat_id_targets(chat_id))
+
+        logger.info(
+            "[REASONING_DEBUG] adapter.edit_message -> message_edit content_head=%r finalize=%s",
+            content[:120], finalize,
+        )
+
+        try:
+            ack = await self._sio.call("message_edit", payload, timeout=8)
+            success = ack.get("success", True) if isinstance(ack, dict) else True
+            return SendResult(success=bool(success), message_id=message_id)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        if not self._relay_capabilities.get("typing"):
+            return
+        if not self._sio or not self._sio.connected:
+            return
+        try:
+            await self._sio.emit("typing", self._chat_id_targets(chat_id))
+        except Exception:
+            pass
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        parts   = chat_id.split(":")
+        user_id = parts[2] if len(parts) > 2 else "unknown"
+        return {"name": f"SkyTower User {user_id}", "type": "dm", "platform": "skytower"}
+
+    # ── 스트리밍 extras ───────────────────────────────────────────────────────
+
+    async def send_chunk(self, text: str) -> None:
+        if self._sio and self._sio.connected:
+            try:
+                await self._sio.emit("message_chunk", {"text": text})
+            except Exception:
+                pass
+
+    async def send_thinking_chunk(self, text: str, chat_id: Optional[str] = None) -> None:
+        """실시간 reasoning 스트리밍 — gateway hook이 있을 때 호출됨 (Option B).
+
+        현재(Option C)는 gateway/run.py에 hook이 없으므로 호출되지 않는다.
+        향후 upstream PR이 merge되면 gateway가 이 메서드를 직접 호출한다.
+        """
+        if not self._sio or not self._sio.connected:
+            return
+        try:
+            payload: Dict[str, Any] = {"text": text}
+            if chat_id:
+                parts = chat_id.split(":")
+                try:
+                    user_id         = int(parts[2]) if len(parts) > 2 else None
+                    conversation_id = int(parts[3]) if len(parts) > 3 else None
+                except (ValueError, IndexError):
+                    user_id = conversation_id = None
+                if conversation_id:
+                    payload["target_conversation_id"] = conversation_id
+                elif user_id:
+                    payload["target_user_id"] = user_id
+            await self._sio.emit("thinking_chunk", payload)
+        except Exception as e:
+            logger.debug("thinking_chunk emit failed: %s", e)
+
+    async def send_notification(
+        self, title: str, body: str = "", level: str = "info"
+    ) -> None:
+        if self._sio and self._sio.connected:
+            try:
+                await self._sio.emit("notify", {"level": level, "title": title, "body": body})
+            except Exception:
+                pass
+
+    # ── Heartbeat ─────────────────────────────────────────────────────────────
+
+    async def _heartbeat_loop(self) -> None:
+        while self._running:
+            await asyncio.sleep(30)
+            if self._sio and self._sio.connected:
+                try:
+                    await self._sio.emit("heartbeat", self._collect_metrics())
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _collect_metrics() -> dict:
+        try:
+            import psutil
+            return {
+                "cpu": psutil.cpu_percent(interval=None),
+                "mem": psutil.virtual_memory().percent,
+                "disk": psutil.disk_usage("/").percent,
+                "agent_type": "hermes",
+            }
+        except ImportError:
+            return {"cpu": 0.0, "mem": 0.0, "disk": 0.0, "agent_type": "hermes"}
+
+    # ── 온보딩 ────────────────────────────────────────────────────────────────
+
+    async def _print_pairing_code(self) -> None:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{self._relay_url}/api/agents/pairing-code",
+                    headers={"Authorization": f"Bearer {self._token}"},
+                    json={"expiresMinutes": 10, "maxUses": 1},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            print("=" * 40)
+            print(f"  친구 추가 코드: {data.get('code', 'N/A')}")
+            print(f"  URL: {data.get('pairUrl', 'N/A')}")
+            print("  유효시간: 10분")
+            print("=" * 40)
+        except Exception as e:
+            logger.warning("Failed to fetch pairing code: %s", e)
+
+
+# System-prompt hint injected for platform="skytower" (consumed by agent.system_prompt.platform_hint
+# via PlatformEntry.platform_hint — no core edit needed).
+SKYTOWER_PLATFORM_HINT = (
+    "You are chatting via Skytower, a web-based relay platform. "
+    "Full Markdown rendering is supported — headings, bold, italic, code blocks, "
+    "tables, and links all display correctly. "
+    "Responses are streamed in real time as you generate them. "
+    "Keep replies conversational and well-structured."
+)
+
+
+async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
+    """Out-of-process delivery (``standalone_sender_fn``) via the Relay REST API.
+
+    Used by send_message / cron when no live gateway adapter is available.
+    chat_id 형식: skytower:{agentId}:{userId}:{conversationId}
+    """
+    from gateway.platforms._shared import send_error
+
+    extra = getattr(pconfig, "extra", {}) or {}
+    relay_url = extra.get("url") or os.getenv("SKYTOWER_URL", "")
+    token = extra.get("token") or os.getenv("SKYTOWER_TOKEN", "")
+    if not relay_url or not token:
+        return send_error("Skytower SKYTOWER_URL or SKYTOWER_TOKEN not configured")
+
+    parts = str(chat_id).split(":")
+    try:
+        conversation_id = int(parts[3]) if len(parts) > 3 else None
+        user_id = int(parts[2]) if len(parts) > 2 else None
+    except (ValueError, IndexError):
+        return send_error(f"Invalid Skytower chat_id format: {chat_id}")
+    if not conversation_id and not user_id:
+        return send_error(f"Cannot determine target from chat_id: {chat_id}")
+
+    payload: dict = {"content": message, "type": "text"}
+    if conversation_id:
+        payload["target_conversation_id"] = conversation_id
+    else:
+        payload["target_user_id"] = user_id
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{relay_url.rstrip('/')}/api/messages",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=payload,
+            )
+        if resp.status_code in (200, 201):
+            data = resp.json() if resp.content else {}
+            return {"success": True, "platform": "skytower", "chat_id": chat_id,
+                    "message_id": str(data.get("id", ""))}
+        return send_error(f"Skytower send failed: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        return send_error(f"Skytower send failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Plugin entry point
+# ---------------------------------------------------------------------------
+
+def register(ctx) -> None:
+    """Plugin entry point — called by the Hermes plugin system at gateway startup."""
+    ctx.register_platform(
+        name="skytower",
+        label="Skytower",
+        adapter_factory=lambda cfg: SkyTowerAdapter(cfg),
+        check_fn=check_skytower_requirements,
+        is_connected=_is_connected,
+        env_enablement_fn=_env_enablement_fn,
+        apply_yaml_config_fn=_apply_yaml_config,
+        required_env=["SKYTOWER_TOKEN", "SKYTOWER_URL"],
+        install_hint="pip install 'python-socketio[asyncio_client]' psutil",
+        allowed_users_env="SKYTOWER_ALLOWED_USERS",
+        allow_all_env="SKYTOWER_ALLOW_ALL_USERS",
+        emoji="🗼",
+        platform_hint=SKYTOWER_PLATFORM_HINT,
+        standalone_sender_fn=_standalone_send,
+    )

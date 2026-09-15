@@ -114,6 +114,7 @@ _PLATFORM_ENV_VARS = {
     "homeassistant": "HASS_TOKEN", "dingtalk": "DINGTALK_CLIENT_ID", "feishu": "FEISHU_APP_ID",
     "wecom": "WECOM_BOT_ID", "wecom_callback": "WECOM_CALLBACK_CORP_ID", "weixin": "WEIXIN_ACCOUNT_ID",
     "qqbot": "QQ_APP_ID",
+    "skytower": "SKYTOWER_TOKEN",
 }
 
 
