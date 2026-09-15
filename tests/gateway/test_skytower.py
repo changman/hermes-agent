@@ -422,3 +422,70 @@ class TestReplyTo:
 
         payload = adapter._sio.emit.call_args[0][1]
         assert "reply_to_id" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Thread (스레드) support
+# ---------------------------------------------------------------------------
+
+class TestThreads:
+    @pytest.mark.asyncio
+    async def test_thread_id_omitted_by_default(self):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound", "type": "text", "content": "스레드 안에서",
+            "user_id": 7, "conversation_id": 3, "id": 50, "thread_root_id": 40,
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert event.source.thread_id is None
+
+    @pytest.mark.asyncio
+    async def test_thread_id_used_when_enabled(self):
+        adapter = _make_adapter(thread_sessions=True)
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound", "type": "text", "content": "스레드 안에서",
+            "user_id": 7, "conversation_id": 3, "id": 50, "thread_root_id": 40,
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert event.source.thread_id == "t40"
+
+    @pytest.mark.asyncio
+    async def test_no_thread_id_outside_a_thread(self):
+        adapter = _make_adapter(thread_sessions=True)
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound", "type": "text", "content": "본문에서",
+            "user_id": 7, "conversation_id": 3, "id": 51,
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert event.source.thread_id is None
+
+    @pytest.mark.asyncio
+    async def test_send_chunk_targets_the_current_conversation(self):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound", "type": "text", "content": "안녕",
+            "user_id": 7, "conversation_id": 3, "id": 52,
+        })
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+
+        await adapter.send_chunk("부분 응답")
+
+        adapter._sio.emit.assert_called_once_with("message_chunk", {
+            "text": "부분 응답",
+            "target_conversation_id": 3,
+        })
+
+    @pytest.mark.asyncio
+    async def test_send_chunk_without_a_known_conversation(self):
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+
+        await adapter.send_chunk("부분 응답")
+
+        adapter._sio.emit.assert_called_once_with("message_chunk", {"text": "부분 응답"})

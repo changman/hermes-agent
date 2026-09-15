@@ -74,6 +74,17 @@ def _extract_reply_to(data: dict) -> tuple[Optional[str], Optional[str]]:
     return str(ref_id), (ref.get("content") or "")
 
 
+def _thread_id(data: dict) -> Optional[str]:
+    """relay payload 의 ``thread_root_id`` 를 세션 키용 스레드 식별자로 바꾼다.
+
+    Relay 는 스레드 안의 메시지에만 이 값을 채운다. build_session_key 가
+    thread_id 를 세션 키에 넣으므로, 이 값을 넘기면 스레드마다 히스토리가
+    갈린다. 기본은 넘기지 않아 스레드도 대화방 맥락을 그대로 이어받는다.
+    """
+    raw = data.get("thread_root_id")
+    return None if raw in (None, "") else f"t{raw}"
+
+
 def _reply_to_id(reply_to: Optional[str]) -> Optional[int]:
     """send(reply_to=...) 로 넘어온 사용자 메시지 id를 relay의 정수 id로 변환한다."""
     if reply_to in (None, ""):
@@ -186,6 +197,9 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._home_channels: Dict[str, str] = _load_home_channels()
         self._file_handler: Optional[FileAccessHandler] = None
         self._relay_capabilities: Dict[str, bool] = {}
+        # gateway 는 send_chunk 에 chat_id 를 주지 않는다. 마지막으로 받은 메시지의
+        # chat_id 를 기억해 두었다가 청크에 대상을 붙인다.
+        self._streaming_chat_id: Optional[str] = None
 
     # ── Per-user home channel ─────────────────────────────────────────────────
 
@@ -419,6 +433,12 @@ class SkyTowerAdapter(BasePlatformAdapter):
         if conv_str:
             chat_topic = channel_names.get(conv_str) or None
 
+        self._streaming_chat_id = chat_id
+
+        # 스레드별 세션 분리는 설정으로 켠다. 켜면 스레드가 대화방 맥락을
+        # 물려받지 않고 독립된 히스토리를 갖는다.
+        thread_id = _thread_id(data) if extra.get("thread_sessions") else None
+
         source = self.build_source(
             chat_id=chat_id,
             chat_name=user_name,
@@ -426,6 +446,7 @@ class SkyTowerAdapter(BasePlatformAdapter):
             user_id=user_str,
             user_name=user_name,
             chat_topic=chat_topic,
+            thread_id=thread_id,
         )
         reply_to_message_id, reply_to_text = _extract_reply_to(data)
         await self.handle_message(MessageEvent(
@@ -719,9 +740,14 @@ class SkyTowerAdapter(BasePlatformAdapter):
     # ── 스트리밍 extras ───────────────────────────────────────────────────────
 
     async def send_chunk(self, text: str) -> None:
+        # 대상을 붙여야 relay 가 그 대화방에만 청크를 보낸다. 붙이지 않으면
+        # 이 에이전트를 보는 모든 화면에 남의 대화방 청크가 흘러 들어간다.
         if self._sio and self._sio.connected:
+            payload: Dict[str, Any] = {"text": text}
+            if self._streaming_chat_id:
+                payload.update(self._chat_id_targets(self._streaming_chat_id))
             try:
-                await self._sio.emit("message_chunk", {"text": text})
+                await self._sio.emit("message_chunk", payload)
             except Exception:
                 pass
 
