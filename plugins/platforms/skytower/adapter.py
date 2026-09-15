@@ -199,7 +199,7 @@ class SkyTowerAdapter(BasePlatformAdapter):
 
     # ── Connection ────────────────────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self._relay_url:
             logger.error("SKYTOWER_URL is not set")
             return False
