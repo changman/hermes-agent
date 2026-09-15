@@ -211,7 +211,11 @@ class SkyTowerAdapter(BasePlatformAdapter):
             reconnection_delay=2,
             reconnection_delay_max=30,
         )
-        self._wire_plugin_handlers(self._sio)  # plugin-registered native handlers
+        # plugin-registered native handlers (upstream >= 2026-08); guarded so the plugin still runs on
+        # older Hermes installs whose BasePlatformAdapter lacks _wire_plugin_handlers.
+        _wire = getattr(self, "_wire_plugin_handlers", None)
+        if _wire is not None:
+            _wire(self._sio)
 
         @self._sio.event
         async def connect():
