@@ -34,6 +34,7 @@ config.yaml에서 채널(conversation_id)별로 스킬을 자동 바인딩할 �
 
 import asyncio
 import base64
+import contextvars
 import json
 import logging
 import os
@@ -104,6 +105,53 @@ def _with_thread_context(text: str, root: dict) -> str:
         f"\"이 글\", \"위 포스트\" 는 이 원문을 가리킵니다.\n"
         f"--- 원문 ({who}{note}) ---\n{body}\n--- 스레드 메시지 ---\n{text}"
     )
+
+
+def _shared_chat_id(agent_id: str, conv_id: str) -> str:
+    """공유 프로젝트 방의 chat_id. 사용자 id 를 넣지 않아 방 하나가 세션 하나가 된다.
+
+    개인 방은 ``skytower:{agentId}:{userId}:{convId}`` 로 사람마다 세션이 갈리지만,
+    공유 방에서는 동료들이 나눈 대화를 에이전트가 한 히스토리로 읽어야 한다.
+    """
+    return f"skytower:{agent_id}:conv:{conv_id}"
+
+
+def _parse_chat_id(chat_id: str) -> tuple[Optional[int], Optional[int]]:
+    """chat_id → (user_id, conversation_id). 공유 방(``:conv:``) 은 user_id 가 None."""
+    parts = chat_id.split(":")
+    try:
+        if len(parts) > 3 and parts[2] == "conv":
+            return None, int(parts[3])
+        user_id = int(parts[2]) if len(parts) > 2 else None
+        conversation_id = int(parts[3]) if len(parts) > 3 else None
+        return user_id, conversation_id
+    except (ValueError, IndexError):
+        return None, None
+
+
+def _project_prompt(project: Optional[dict], participants: Optional[list]) -> Optional[str]:
+    """relay 가 실어 보낸 프로젝트 맥락을 채널 프롬프트 문장으로 만든다.
+
+    페르소나는 프로젝트 리더가 적은 그대로, 작업 폴더는 지시문으로 넣는다.
+    (hermes 의 terminal.cwd 는 게이트웨이 전역이라 세션별로 강제할 수 없다.
+    폴더 제한의 강제는 relay 쪽 파일 접근 범위 제한(P4)으로 한다.)
+    """
+    if not isinstance(project, dict):
+        return None
+    lines: List[str] = []
+    name = (project.get("name") or "").strip()
+    if name:
+        lines.append(f'당신은 프로젝트 "{name}" 의 공유 대화방에 참여한 에이전트입니다.')
+    persona = (project.get("persona") or "").strip()
+    if persona:
+        lines.append(persona)
+    workdir = (project.get("workdir") or "").strip()
+    if workdir:
+        lines.append(f"이 프로젝트의 작업 폴더는 `{workdir}` 입니다. 파일 작업은 이 폴더 안에서만 하세요.")
+    names = [str(p.get("name")) for p in (participants or []) if isinstance(p, dict) and p.get("name")]
+    if names:
+        lines.append("참여자: " + ", ".join(names) + ". 메시지 앞의 [이름] 이 화자입니다.")
+    return "\n".join(lines) or None
 
 
 def _reply_to_id(reply_to: Optional[str]) -> Optional[int]:
@@ -218,9 +266,17 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._home_channels: Dict[str, str] = _load_home_channels()
         self._file_handler: Optional[FileAccessHandler] = None
         self._relay_capabilities: Dict[str, bool] = {}
-        # gateway 는 send_chunk 에 chat_id 를 주지 않는다. 마지막으로 받은 메시지의
-        # chat_id 를 기억해 두었다가 청크에 대상을 붙인다.
-        self._streaming_chat_id: Optional[str] = None
+        # gateway 는 send_chunk 에 chat_id 를 주지 않는다. 세션 task 는 메시지를
+        # 받은 컨텍스트를 복사해 만들어지므로, ContextVar 에 넣어 두면 병렬 세션이
+        # 있어도 각 task 가 자기 대화방을 본다. (전역 필드 하나로 두면 방 A 가
+        # 스트리밍하는 중에 방 B 메시지가 오는 순간 A 의 청크가 B 로 샌다.)
+        self._current_chat_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+            "skytower_current_chat_id", default=None
+        )
+        # 공유 프로젝트 방은 chat_type="group" 이다. 사람마다 세션을 나누면 동료의
+        # 말을 못 읽으므로, 설정에 없으면 방 하나 = 세션 하나로 둔다.
+        if isinstance(self.config.extra, dict):
+            self.config.extra.setdefault("group_sessions_per_user", False)
 
     # ── Per-user home channel ─────────────────────────────────────────────────
 
@@ -428,11 +484,18 @@ class SkyTowerAdapter(BasePlatformAdapter):
                 content, file_content, data
             )
 
-        chat_id = (
-            f"skytower:{self._agent_id}:{user_str}:{conv_str}"
-            if conv_str
-            else f"skytower:{self._agent_id}:{user_str}"
-        )
+        # 공유 프로젝트 방: relay 가 shared=true 와 project / participants 를 실어 보낸다.
+        # 멘션 게이팅은 relay 가 하지만, mentioned=false 가 오면 여기서도 버린다.
+        shared = bool(data.get("shared")) and bool(conv_str)
+        if shared and data.get("mentioned") is False:
+            logger.debug("shared room message without mention dropped conv=%s", conv_str)
+            return
+        if shared:
+            chat_id = _shared_chat_id(self._agent_id, conv_str)
+        elif conv_str:
+            chat_id = f"skytower:{self._agent_id}:{user_str}:{conv_str}"
+        else:
+            chat_id = f"skytower:{self._agent_id}:{user_str}"
 
         # ── 채널별 스킬 바인딩 & 프롬프트 해석 ──────────────────────────────
         from gateway.platforms.base import resolve_channel_skills, resolve_channel_prompt
@@ -448,22 +511,28 @@ class SkyTowerAdapter(BasePlatformAdapter):
                 auto_skill = [_default]
 
         channel_prompt = resolve_channel_prompt(extra, _lookup_id, _parent_id)
+        if shared:
+            project_prompt = _project_prompt(data.get("project"), data.get("participants"))
+            if project_prompt:
+                channel_prompt = f"{project_prompt}\n\n{channel_prompt}" if channel_prompt else project_prompt
 
         channel_names: dict = extra.get("channel_names") or {}
         chat_topic: str | None = None
         if conv_str:
             chat_topic = channel_names.get(conv_str) or None
 
-        self._streaming_chat_id = chat_id
+        self._current_chat_id.set(chat_id)
 
         # 스레드별 세션 분리는 설정으로 켠다. 켜면 스레드가 대화방 맥락을
         # 물려받지 않고 독립된 히스토리를 갖는다.
         thread_id = _thread_id(data) if extra.get("thread_sessions") else None
 
+        project = data.get("project") if shared else None
+        room_name = (project.get("name") if isinstance(project, dict) else None) or user_name
         source = self.build_source(
             chat_id=chat_id,
-            chat_name=user_name,
-            chat_type="dm",
+            chat_name=room_name if shared else user_name,
+            chat_type="group" if shared else "dm",
             user_id=user_str,
             user_name=user_name,
             chat_topic=chat_topic,
@@ -667,13 +736,7 @@ class SkyTowerAdapter(BasePlatformAdapter):
     @staticmethod
     def _chat_id_targets(chat_id: str) -> Dict[str, int]:
         """chat_id(``skytower:agentId:userId[:convId]``)에서 relay 타겟 필드를 추출한다."""
-        parts = chat_id.split(":")
-        try:
-            user_id         = int(parts[2]) if len(parts) > 2 else None
-            conversation_id = int(parts[3]) if len(parts) > 3 else None
-        except (ValueError, IndexError):
-            user_id = conversation_id = None
-
+        user_id, conversation_id = _parse_chat_id(chat_id)
         targets: Dict[str, int] = {}
         if conversation_id:
             targets["target_conversation_id"] = conversation_id
@@ -763,23 +826,35 @@ class SkyTowerAdapter(BasePlatformAdapter):
             pass
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        parts   = chat_id.split(":")
-        user_id = parts[2] if len(parts) > 2 else "unknown"
-        return {"name": f"SkyTower User {user_id}", "type": "dm", "platform": "skytower"}
+        user_id, conversation_id = _parse_chat_id(chat_id)
+        if user_id is None and conversation_id is not None:
+            return {"name": f"SkyTower Room {conversation_id}", "type": "group", "platform": "skytower"}
+        who = user_id if user_id is not None else "unknown"
+        return {"name": f"SkyTower User {who}", "type": "dm", "platform": "skytower"}
 
     # ── 스트리밍 extras ───────────────────────────────────────────────────────
 
-    async def send_chunk(self, text: str) -> None:
-        # 대상을 붙여야 relay 가 그 대화방에만 청크를 보낸다. 붙이지 않으면
-        # 이 에이전트를 보는 모든 화면에 남의 대화방 청크가 흘러 들어간다.
-        if self._sio and self._sio.connected:
-            payload: Dict[str, Any] = {"text": text}
-            if self._streaming_chat_id:
-                payload.update(self._chat_id_targets(self._streaming_chat_id))
-            try:
-                await self._sio.emit("message_chunk", payload)
-            except Exception:
-                pass
+    def _chunk_targets(self, chat_id: Optional[str]) -> Optional[Dict[str, int]]:
+        """청크의 대상. 인자가 없으면 현재 세션 컨텍스트에서 읽는다. 모르면 None."""
+        chat_id = chat_id or self._current_chat_id.get()
+        if not chat_id:
+            return None
+        return self._chat_id_targets(chat_id) or None
+
+    async def send_chunk(self, text: str, chat_id: Optional[str] = None) -> None:
+        # 대상을 붙여야 relay 가 그 대화방에만 청크를 보낸다. 대상을 모르면 엉뚱한
+        # 방에 보내느니 버린다 — 이 에이전트를 보는 모든 화면에 남의 대화방 청크가
+        # 흘러 들어가는 것보다 낫다.
+        if not (self._sio and self._sio.connected):
+            return
+        targets = self._chunk_targets(chat_id)
+        if targets is None:
+            logger.warning("send_chunk dropped: no target conversation in this context")
+            return
+        try:
+            await self._sio.emit("message_chunk", {"text": text, **targets})
+        except Exception:
+            pass
 
     async def send_thinking_chunk(self, text: str, chat_id: Optional[str] = None) -> None:
         """실시간 reasoning 스트리밍 — gateway hook이 있을 때 호출됨 (Option B).
@@ -789,20 +864,12 @@ class SkyTowerAdapter(BasePlatformAdapter):
         """
         if not self._sio or not self._sio.connected:
             return
+        targets = self._chunk_targets(chat_id)
+        if targets is None:
+            logger.warning("thinking_chunk dropped: no target conversation in this context")
+            return
         try:
-            payload: Dict[str, Any] = {"text": text}
-            if chat_id:
-                parts = chat_id.split(":")
-                try:
-                    user_id         = int(parts[2]) if len(parts) > 2 else None
-                    conversation_id = int(parts[3]) if len(parts) > 3 else None
-                except (ValueError, IndexError):
-                    user_id = conversation_id = None
-                if conversation_id:
-                    payload["target_conversation_id"] = conversation_id
-                elif user_id:
-                    payload["target_user_id"] = user_id
-            await self._sio.emit("thinking_chunk", payload)
+            await self._sio.emit("thinking_chunk", {"text": text, **targets})
         except Exception as e:
             logger.debug("thinking_chunk emit failed: %s", e)
 

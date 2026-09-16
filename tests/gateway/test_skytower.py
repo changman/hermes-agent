@@ -233,22 +233,38 @@ class TestSend:
 
 class TestStreamingExtras:
     @pytest.mark.asyncio
-    async def test_send_chunk(self):
+    async def test_send_chunk_with_explicit_chat_id(self):
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+
+        await adapter.send_chunk("partial text", chat_id="skytower:testAgentId:7:3")
+        adapter._sio.emit.assert_called_once_with(
+            "message_chunk", {"text": "partial text", "target_conversation_id": 3}
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_thinking_chunk_with_explicit_chat_id(self):
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+
+        await adapter.send_thinking_chunk("reasoning...", chat_id="skytower:testAgentId:7:3")
+        adapter._sio.emit.assert_called_once_with(
+            "thinking_chunk", {"text": "reasoning...", "target_conversation_id": 3}
+        )
+
+    @pytest.mark.asyncio
+    async def test_untargeted_chunks_are_dropped(self):
+        # 대상을 모르는 청크를 그냥 보내면 relay 가 이 에이전트를 보는 모든 화면에
+        # 뿌린다. 보내지 않는 쪽이 낫다.
         adapter = _make_adapter()
         adapter._sio = AsyncMock()
         adapter._sio.connected = True
 
         await adapter.send_chunk("partial text")
-        adapter._sio.emit.assert_called_once_with("message_chunk", {"text": "partial text"})
-
-    @pytest.mark.asyncio
-    async def test_send_thinking_chunk(self):
-        adapter = _make_adapter()
-        adapter._sio = AsyncMock()
-        adapter._sio.connected = True
-
         await adapter.send_thinking_chunk("reasoning...")
-        adapter._sio.emit.assert_called_once_with("thinking_chunk", {"text": "reasoning..."})
+        adapter._sio.emit.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_notification(self):
@@ -488,7 +504,159 @@ class TestThreads:
 
         await adapter.send_chunk("부분 응답")
 
-        adapter._sio.emit.assert_called_once_with("message_chunk", {"text": "부분 응답"})
+        adapter._sio.emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_parallel_sessions_keep_their_own_chunk_target(self):
+        """방 A 가 스트리밍하는 중에 방 B 메시지가 와도 A 의 청크는 A 로 간다 (skytower#11)."""
+        import asyncio
+
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+        started = asyncio.Event()
+        release = asyncio.Event()
+        tasks = []
+
+        async def slow_turn(event):
+            # gateway 처럼 세션 처리를 별도 task 로 띄운다 (컨텍스트 복사)
+            async def run():
+                started.set()
+                await release.wait()
+                await adapter.send_chunk("A 의 청크")
+            tasks.append(asyncio.create_task(run()))
+
+        adapter.handle_message = slow_turn
+        await adapter._handle_relay_message({
+            "direction": "outbound", "type": "text", "content": "A",
+            "user_id": 7, "conversation_id": 100, "id": 1,
+        })
+        await started.wait()
+        # A 가 아직 돌고 있는데 B 메시지가 온다
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound", "type": "text", "content": "B",
+            "user_id": 8, "conversation_id": 200, "id": 2,
+        })
+        release.set()
+        await asyncio.gather(*tasks)
+
+        adapter._sio.emit.assert_called_once_with("message_chunk", {
+            "text": "A 의 청크",
+            "target_conversation_id": 100,
+        })
+
+
+class TestSharedRooms:
+    """공유 프로젝트 방: relay 가 shared=true 와 project / participants 를 실어 보낸다."""
+
+    def _shared_payload(self, **over):
+        base = {
+            "direction": "outbound", "type": "text", "content": "@Hermes 정리해줘",
+            "user_id": 7, "user_name": "Alice", "conversation_id": 40, "id": 90,
+            "shared": True, "mentioned": True, "mention_only": True,
+            "project": {"id": 12, "name": "Acme", "workdir": "D:/work/acme",
+                        "persona": "너는 Acme 팀 비서다", "permissions": {"chat": True}},
+            "participants": [{"id": 7, "name": "Alice"}, {"id": 8, "name": "Bob"}],
+        }
+        base.update(over)
+        return base
+
+    @pytest.mark.asyncio
+    async def test_shared_room_is_a_group_session_without_user_in_chat_id(self):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message(self._shared_payload())
+        event = adapter.handle_message.call_args[0][0]
+        assert event.source.chat_id == "skytower:testAgentId:conv:40"
+        assert event.source.chat_type == "group"
+        assert event.source.user_id == "7"
+        assert event.source.user_name == "Alice"
+        assert event.source.chat_name == "Acme"
+
+    @pytest.mark.asyncio
+    async def test_shared_room_session_is_shared_across_users(self):
+        from gateway.session import build_session_key
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message(self._shared_payload(user_id=7, user_name="Alice"))
+        a = adapter.handle_message.call_args[0][0].source
+        await adapter._handle_relay_message(self._shared_payload(user_id=8, user_name="Bob"))
+        b = adapter.handle_message.call_args[0][0].source
+        gspu = adapter.config.extra["group_sessions_per_user"]
+        assert gspu is False
+        assert build_session_key(a, group_sessions_per_user=gspu) == build_session_key(b, group_sessions_per_user=gspu)
+
+    @pytest.mark.asyncio
+    async def test_personal_rooms_still_split_by_user(self):
+        from gateway.session import build_session_key
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        for uid in (7, 8):
+            await adapter._handle_relay_message({
+                "direction": "outbound", "type": "text", "content": "hi",
+                "user_id": uid, "conversation_id": 3, "id": uid,
+            })
+        keys = {build_session_key(c[0][0].source) for c in adapter.handle_message.call_args_list}
+        assert len(keys) == 2
+
+    @pytest.mark.asyncio
+    async def test_project_context_becomes_channel_prompt(self):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message(self._shared_payload())
+        prompt = adapter.handle_message.call_args[0][0].channel_prompt
+        assert '프로젝트 "Acme"' in prompt
+        assert "너는 Acme 팀 비서다" in prompt
+        assert "D:/work/acme" in prompt
+        assert "Alice, Bob" in prompt
+
+    @pytest.mark.asyncio
+    async def test_project_prompt_is_prepended_to_configured_channel_prompt(self):
+        adapter = _make_adapter(channel_prompts={"40": "항상 한국어로"})
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message(self._shared_payload())
+        prompt = adapter.handle_message.call_args[0][0].channel_prompt
+        assert prompt.startswith('당신은 프로젝트 "Acme"')
+        assert prompt.endswith("항상 한국어로")
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_shared_message_is_dropped(self):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message(self._shared_payload(mentioned=False, content="점심 뭐 먹지"))
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_replies_and_chunks_target_the_room(self):
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+        adapter._relay_capabilities = {}
+
+        await adapter.send("skytower:testAgentId:conv:40", "답")
+        adapter._sio.emit.assert_called_with(
+            "message_done", {"content": "답", "type": "text", "target_conversation_id": 40}
+        )
+        await adapter.send_chunk("부분", chat_id="skytower:testAgentId:conv:40")
+        adapter._sio.emit.assert_called_with("message_chunk", {"text": "부분", "target_conversation_id": 40})
+
+    @pytest.mark.asyncio
+    async def test_get_chat_info_for_a_room(self):
+        adapter = _make_adapter()
+        info = await adapter.get_chat_info("skytower:testAgentId:conv:40")
+        assert info["type"] == "group"
+        assert "40" in info["name"]
+
+    def test_parse_chat_id(self):
+        from plugins.platforms.skytower.adapter import _parse_chat_id
+
+        assert _parse_chat_id("skytower:a:7:3") == (7, 3)
+        assert _parse_chat_id("skytower:a:7") == (7, None)
+        assert _parse_chat_id("skytower:a:conv:40") == (None, 40)
+        assert _parse_chat_id("garbage") == (None, None)
 
 
 class TestThreadContext:
