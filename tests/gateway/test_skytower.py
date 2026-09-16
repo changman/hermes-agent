@@ -489,3 +489,50 @@ class TestThreads:
         await adapter.send_chunk("부분 응답")
 
         adapter._sio.emit.assert_called_once_with("message_chunk", {"text": "부분 응답"})
+
+
+class TestThreadContext:
+    @pytest.mark.asyncio
+    async def test_thread_root_is_prepended_to_the_message(self):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound", "type": "text", "content": "이 포스트를 정리해줘",
+            "user_id": 7, "conversation_id": 3, "id": 60, "thread_root_id": 40,
+            "reply_to": {"id": 40, "direction": "inbound", "type": "text", "user_name": None, "content": "각 단계별 칸반 카드"},
+            "thread_root": {"id": 40, "direction": "inbound", "type": "text", "user_name": None,
+                            "content": "각 단계별 칸반 카드를 작성했습니다. [1] 최신 AI 트렌드 정보 수집 ...", "truncated": False},
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert "각 단계별 칸반 카드를 작성했습니다." in event.text
+        assert event.text.rstrip().endswith("이 포스트를 정리해줘")
+        assert "당신(에이전트)이 쓴 글" in event.text
+        # 전문을 붙였으니 같은 글을 가리키는 포인터는 지운다
+        assert event.reply_to_message_id is None
+        assert event.reply_to_text is None
+
+    @pytest.mark.asyncio
+    async def test_explicit_quote_inside_a_thread_is_kept(self):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound", "type": "text", "content": "그 부분 다시",
+            "user_id": 7, "conversation_id": 3, "id": 61, "thread_root_id": 40,
+            "reply_to": {"id": 55, "direction": "inbound", "type": "text", "user_name": None, "content": "두 번째 방법은"},
+            "thread_root": {"id": 40, "direction": "inbound", "type": "text", "user_name": None, "content": "루트 글", "truncated": False},
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert "루트 글" in event.text
+        assert event.reply_to_message_id == "55"
+        assert event.reply_to_text == "두 번째 방법은"
+
+    @pytest.mark.asyncio
+    async def test_no_thread_root_leaves_text_untouched(self):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound", "type": "text", "content": "본문 메시지",
+            "user_id": 7, "conversation_id": 3, "id": 62,
+        })
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text == "본문 메시지"

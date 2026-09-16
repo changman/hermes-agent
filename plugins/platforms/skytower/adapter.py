@@ -85,6 +85,27 @@ def _thread_id(data: dict) -> Optional[str]:
     return None if raw in (None, "") else f"t{raw}"
 
 
+def _with_thread_context(text: str, root: dict) -> str:
+    """스레드 답글 앞에 루트 글 전문을 붙인다.
+
+    Relay 는 스레드 안의 메시지에 ``thread_root`` 로 루트 글을 실어 보낸다.
+    세션에 루트가 남아 있지 않아도 (오래된 글, 세션 초기화, thread_sessions)
+    무엇에 대한 답인지 알 수 있도록 본문에 넣는다. 500자 포인터로는
+    "이 글을 정리해줘" 같은 요청을 처리할 수 없다.
+    """
+    body = (root.get("content") or "").strip()
+    if root.get("direction") == "inbound":
+        who = "당신(에이전트)이 쓴 글"
+    else:
+        who = f"{root.get('user_name') or '사용자'}가 쓴 글"
+    note = " · 긴 글이라 앞부분만" if root.get("truncated") else ""
+    return (
+        f"[스레드 답글] 아래는 다음 글에 달린 스레드 안의 메시지입니다. "
+        f"\"이 글\", \"위 포스트\" 는 이 원문을 가리킵니다.\n"
+        f"--- 원문 ({who}{note}) ---\n{body}\n--- 스레드 메시지 ---\n{text}"
+    )
+
+
 def _reply_to_id(reply_to: Optional[str]) -> Optional[int]:
     """send(reply_to=...) 로 넘어온 사용자 메시지 id를 relay의 정수 id로 변환한다."""
     if reply_to in (None, ""):
@@ -449,6 +470,15 @@ class SkyTowerAdapter(BasePlatformAdapter):
             thread_id=thread_id,
         )
         reply_to_message_id, reply_to_text = _extract_reply_to(data)
+
+        thread_root = data.get("thread_root")
+        if isinstance(thread_root, dict) and (thread_root.get("content") or "").strip():
+            content = _with_thread_context(content, thread_root)
+            # relay 는 명시적 인용이 없을 때 reply_to 에 루트 요약을 채운다.
+            # 전문을 이미 붙였으니 같은 글을 가리키는 포인터는 지운다.
+            if reply_to_message_id is not None and str(thread_root.get("id")) == reply_to_message_id:
+                reply_to_message_id = reply_to_text = None
+
         await self.handle_message(MessageEvent(
             text=content,
             message_type=message_type,
