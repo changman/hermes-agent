@@ -54,7 +54,14 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.platforms.skytower_files import FileAccessHandler
-from . import confinement
+
+# 프로젝트 작업 폴더 confinement 는 부가 기능이다. 파일이 빠진 채 배포됐거나 이 hermes 버전과
+# 안 맞아 import 가 실패해도 접속(어댑터 등록)까지 막지는 않는다 — 경고만 남기고 제한 없이 돈다.
+try:
+    from . import confinement
+except Exception as _confinement_exc:  # pragma: no cover - 배포 환경 차이
+    confinement = None
+    logging.getLogger(__name__).warning("skytower: confinement unavailable, running without folder limits: %s", _confinement_exc)
 
 logger = logging.getLogger(__name__)
 
@@ -551,10 +558,14 @@ class SkyTowerAdapter(BasePlatformAdapter):
 
         # 공유 프로젝트 방의 작업 폴더: 이 세션의 도구 호출을 그 폴더 안으로 제한한다
         # (confinement.py). 개인 방이나 폴더가 없는 프로젝트는 제한을 푼다.
-        confinement.remember(
-            self._source_session_key(source),
-            (project or {}).get("workdir") if shared else None,
-        )
+        if confinement is not None:
+            try:
+                confinement.remember(
+                    self._source_session_key(source),
+                    (project or {}).get("workdir") if shared else None,
+                )
+            except Exception as exc:
+                logger.warning("skytower: confinement.remember failed (message still delivered): %s", exc)
 
         thread_root = data.get("thread_root")
         if isinstance(thread_root, dict) and (thread_root.get("content") or "").strip():
@@ -1023,5 +1034,10 @@ def register(ctx) -> None:
         platform_hint=SKYTOWER_PLATFORM_HINT,
         standalone_sender_fn=_standalone_send,
     )
-    # 프로젝트 작업 폴더 confinement: 세션 매핑과 도구 호출 검사 훅
-    confinement.register_hooks(ctx)
+    # 프로젝트 작업 폴더 confinement: 세션 매핑과 도구 호출 검사 훅.
+    # 훅 등록이 실패해도 플랫폼 등록은 이미 끝났으므로 접속에는 영향이 없다.
+    if confinement is not None:
+        try:
+            confinement.register_hooks(ctx)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("skytower: confinement hooks not registered: %s", exc)
