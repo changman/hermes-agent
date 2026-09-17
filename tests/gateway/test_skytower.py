@@ -678,6 +678,19 @@ class TestSharedRooms:
 
 class TestThreadContext:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("reply", ["yes", "Yes", " ok ", "approve", "no", "/approve", "/deny always", "👍"])
+    async def test_approval_words_and_slash_commands_keep_bare_text(self, reply):
+        # 스레드 안에서 친 "yes" 가 승인으로 먹으려면 원문 맥락을 붙이면 안 된다
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message({
+            "direction": "outbound", "type": "text", "content": reply, "user_id": 7,
+            "conversation_id": 3, "id": 9, "thread_root_id": 5,
+            "thread_root": {"id": 5, "content": "git pull 해줘", "direction": "outbound", "user_name": "홍길동"},
+        })
+        assert adapter.handle_message.call_args[0][0].text == reply.strip()
+
+    @pytest.mark.asyncio
     async def test_thread_root_is_prepended_to_the_message(self):
         adapter = _make_adapter()
         adapter.handle_message = AsyncMock()

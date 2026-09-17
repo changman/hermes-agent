@@ -94,6 +94,22 @@ def _thread_id(data: dict) -> Optional[str]:
     return None if raw in (None, "") else f"t{raw}"
 
 
+# hermes 가 승인 대기 중 그대로 승인/거부로 받아들이는 한 단어 답 (gateway/run_busy.py
+# _PLAINTEXT_APPROVAL_WORDS 와 같게). 앞에 스레드 맥락을 붙이면 승인이 아니라 지시 수정으로
+# 처리되어 "Dangerous command requires approval" 이 끝없이 반복된다.
+_BARE_REPLIES = frozenset({
+    "approve", "yes", "ok", "okay", "confirm", "y", "👍",
+    "deny", "no", "reject", "cancel", "n", "👎",
+    "always", "approve always", "always approve", "session", "approve session", "session approve",
+})
+
+
+def _is_control_reply(text: str) -> bool:
+    """승인/거부 한 단어이거나 슬래시 명령이면 참 — 이런 메시지에는 스레드 맥락을 붙이지 않는다."""
+    t = (text or "").strip()
+    return t.startswith("/") or t.lower() in _BARE_REPLIES
+
+
 def _with_thread_context(text: str, root: dict) -> str:
     """스레드 답글 앞에 루트 글 전문을 붙인다.
 
@@ -568,7 +584,8 @@ class SkyTowerAdapter(BasePlatformAdapter):
                 logger.warning("skytower: confinement.remember failed (message still delivered): %s", exc)
 
         thread_root = data.get("thread_root")
-        if isinstance(thread_root, dict) and (thread_root.get("content") or "").strip():
+        if (isinstance(thread_root, dict) and (thread_root.get("content") or "").strip()
+                and not _is_control_reply(content)):
             content = _with_thread_context(content, thread_root)
             # relay 는 명시적 인용이 없을 때 reply_to 에 루트 요약을 채운다.
             # 전문을 이미 붙였으니 같은 글을 가리키는 포인터는 지운다.
