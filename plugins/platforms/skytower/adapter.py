@@ -54,6 +54,7 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.platforms.skytower_files import FileAccessHandler
+from . import confinement
 
 logger = logging.getLogger(__name__)
 
@@ -540,6 +541,13 @@ class SkyTowerAdapter(BasePlatformAdapter):
         )
         reply_to_message_id, reply_to_text = _extract_reply_to(data)
 
+        # 공유 프로젝트 방의 작업 폴더: 이 세션의 도구 호출을 그 폴더 안으로 제한한다
+        # (confinement.py). 개인 방이나 폴더가 없는 프로젝트는 제한을 푼다.
+        confinement.remember(
+            self._source_session_key(source),
+            (project or {}).get("workdir") if shared else None,
+        )
+
         thread_root = data.get("thread_root")
         if isinstance(thread_root, dict) and (thread_root.get("content") or "").strip():
             content = _with_thread_context(content, thread_root)
@@ -1007,3 +1015,5 @@ def register(ctx) -> None:
         platform_hint=SKYTOWER_PLATFORM_HINT,
         standalone_sender_fn=_standalone_send,
     )
+    # 프로젝트 작업 폴더 confinement: 세션 매핑과 도구 호출 검사 훅
+    confinement.register_hooks(ctx)
