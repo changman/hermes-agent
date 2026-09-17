@@ -167,6 +167,7 @@ function Install-PluginFiles {
         $files = @(
             "plugins/platforms/skytower/__init__.py",
             "plugins/platforms/skytower/adapter.py",
+            "plugins/platforms/skytower/confinement.py",
             "plugins/platforms/skytower/plugin.yaml",
             "gateway/platforms/skytower_files.py"
         )
