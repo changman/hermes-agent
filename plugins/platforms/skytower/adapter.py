@@ -274,8 +274,9 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._current_chat_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
             "skytower_current_chat_id", default=None
         )
-        # 공유 프로젝트 방은 chat_type="group" 이다. 사람마다 세션을 나누면 동료의
-        # 말을 못 읽으므로, 설정에 없으면 방 하나 = 세션 하나로 둔다.
+        # 공유 프로젝트 방은 chat_type="group" 이다. 어댑터 쪽 세션 키 계산이 게이트웨이와
+        # 같은 결과를 내도록 extra 에도 적어 둔다 (실제 분리 해제는 _handle_relay_message 의
+        # 방 단위 thread_id 가 한다 — 게이트웨이는 전역 설정을 보기 때문).
         if isinstance(self.config.extra, dict):
             self.config.extra.setdefault("group_sessions_per_user", False)
 
@@ -527,6 +528,13 @@ class SkyTowerAdapter(BasePlatformAdapter):
         # 스레드별 세션 분리는 설정으로 켠다. 켜면 스레드가 대화방 맥락을
         # 물려받지 않고 독립된 히스토리를 갖는다.
         thread_id = _thread_id(data) if extra.get("thread_sessions") else None
+        # 공유 방은 방 하나 = 세션 하나여야 동료의 말을 같이 읽는다. 게이트웨이는 세션 키를
+        # 만들 때 플랫폼 extra 가 아니라 전역 config.group_sessions_per_user(기본 True) 를
+        # 보므로 extra 로는 못 막는다. 대신 build_session_key 가 thread_id 가 있으면
+        # (thread_sessions_per_user 기본 False) 사용자 부분을 붙이지 않는 규칙을 쓴다:
+        # 방 단위 thread_id 를 주면 전역 설정과 무관하게 사용자별 분리가 꺼진다.
+        if shared and thread_id is None:
+            thread_id = f"conv{conv_str}"
 
         project = data.get("project") if shared else None
         room_name = (project.get("name") if isinstance(project, dict) else None) or user_name

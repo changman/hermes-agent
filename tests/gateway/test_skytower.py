@@ -584,9 +584,26 @@ class TestSharedRooms:
         a = adapter.handle_message.call_args[0][0].source
         await adapter._handle_relay_message(self._shared_payload(user_id=8, user_name="Bob"))
         b = adapter.handle_message.call_args[0][0].source
-        gspu = adapter.config.extra["group_sessions_per_user"]
-        assert gspu is False
-        assert build_session_key(a, group_sessions_per_user=gspu) == build_session_key(b, group_sessions_per_user=gspu)
+        # 게이트웨이는 전역 config.group_sessions_per_user(기본 True) 로 키를 만든다.
+        # 그 기본값에서도 두 사람의 키가 같아야 하고, 키에 사용자 id 가 없어야 한다.
+        ka = build_session_key(a, group_sessions_per_user=True)
+        kb = build_session_key(b, group_sessions_per_user=True)
+        assert ka == kb
+        assert not ka.endswith(":7") and not ka.endswith(":8")
+        assert a.thread_id == "conv40"
+        assert ka == build_session_key(a, group_sessions_per_user=False), "adapter-side and gateway-side keys agree"
+
+    @pytest.mark.asyncio
+    async def test_shared_room_thread_session_keeps_real_thread_id(self):
+        # thread_sessions 를 켜면 실제 스레드 id 가 우선한다 (그 세션도 사용자별로 안 갈린다)
+        from gateway.session import build_session_key
+
+        adapter = _make_adapter(thread_sessions=True)
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message(self._shared_payload(thread_root_id=5283))
+        src = adapter.handle_message.call_args[0][0].source
+        assert src.thread_id == "t5283"
+        assert not build_session_key(src, group_sessions_per_user=True).endswith(":7")
 
     @pytest.mark.asyncio
     async def test_personal_rooms_still_split_by_user(self):
