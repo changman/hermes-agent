@@ -281,6 +281,12 @@ class SkyTowerAdapter(BasePlatformAdapter):
         self._current_chat_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
             "skytower_current_chat_id", default=None
         )
+        # 지금 처리 중인 메시지가 속한 스레드. 상태 메시지("💻 Running …")에는 reply_to 가 없어
+        # relay 가 붙일 스레드를 추측해야 했고, 답을 먼저 보낸 뒤 이어지는 상태는 본문으로 샜다.
+        # 같은 컨텍스트 복사 원리로 세션 task 안의 모든 send 가 이 스레드를 달고 나간다.
+        self._current_thread_root: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+            "skytower_current_thread_root", default=None
+        )
         # 공유 프로젝트 방은 chat_type="group" 이다. 어댑터 쪽 세션 키 계산이 게이트웨이와
         # 같은 결과를 내도록 extra 에도 적어 둔다 (실제 분리 해제는 _handle_relay_message 의
         # 방 단위 thread_id 가 한다 — 게이트웨이는 전역 설정을 보기 때문).
@@ -531,6 +537,8 @@ class SkyTowerAdapter(BasePlatformAdapter):
             chat_topic = channel_names.get(conv_str) or None
 
         self._current_chat_id.set(chat_id)
+        _raw_root = data.get("thread_root_id")
+        self._current_thread_root.set(int(_raw_root) if _raw_root not in (None, "") else None)
 
         # 스레드별 세션 분리는 설정으로 켠다. 켜면 스레드가 대화방 맥락을
         # 물려받지 않고 독립된 히스토리를 갖는다.
@@ -787,6 +795,10 @@ class SkyTowerAdapter(BasePlatformAdapter):
         rid = _reply_to_id(reply_to)
         if rid is not None:
             payload["reply_to_id"] = rid
+        # 처리 중인 메시지가 스레드 안이면 상태·답 모두 그 스레드로 (relay 의 target_thread_root_id)
+        thread_root = self._current_thread_root.get()
+        if thread_root is not None and "target_conversation_id" in payload:
+            payload["target_thread_root_id"] = thread_root
 
         logger.info(
             "[REASONING_DEBUG] adapter.send -> message_done content_head=%r",
