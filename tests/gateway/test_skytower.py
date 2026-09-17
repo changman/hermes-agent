@@ -676,6 +676,55 @@ class TestSharedRooms:
         assert _parse_chat_id("garbage") == (None, None)
 
 
+class TestStatusThreadTarget:
+    """스레드 안의 요청을 처리하는 동안 보내는 메시지(상태 포함)는 그 스레드를 달고 나간다."""
+
+    @pytest.mark.asyncio
+    async def test_send_carries_thread_of_the_message_being_processed(self):
+        import asyncio
+
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock(); adapter._sio.connected = True; adapter._relay_capabilities = {}
+        sent = []
+
+        async def turn(event):
+            async def run():
+                await adapter.send("skytower:testAgentId:7:3", "💻 Running npm install")
+                await adapter.send("skytower:testAgentId:7:3", "끝", reply_to="9")
+            sent.append(asyncio.create_task(run()))
+
+        adapter.handle_message = turn
+        await adapter._handle_relay_message({
+            "direction": "outbound", "type": "text", "content": "설치해줘", "user_id": 7,
+            "conversation_id": 3, "id": 9, "thread_root_id": 5,
+            "thread_root": {"id": 5, "content": "루트", "direction": "outbound", "user_name": "홍길동"},
+        })
+        await asyncio.gather(*sent)
+        payloads = [c.args[1] for c in adapter._sio.emit.call_args_list if c.args[0] == "message_done"]
+        assert len(payloads) == 2
+        assert all(p["target_thread_root_id"] == 5 and p["target_conversation_id"] == 3 for p in payloads)
+        assert payloads[1]["reply_to_id"] == 9
+
+    @pytest.mark.asyncio
+    async def test_body_message_has_no_thread_target(self):
+        import asyncio
+
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock(); adapter._sio.connected = True; adapter._relay_capabilities = {}
+        tasks = []
+
+        async def turn(event):
+            tasks.append(asyncio.create_task(adapter.send("skytower:testAgentId:7:3", "상태")))
+
+        adapter.handle_message = turn
+        await adapter._handle_relay_message({
+            "direction": "outbound", "type": "text", "content": "본문 질문", "user_id": 7, "conversation_id": 3, "id": 10,
+        })
+        await asyncio.gather(*tasks)
+        payload = adapter._sio.emit.call_args_list[-1].args[1]
+        assert "target_thread_root_id" not in payload
+
+
 class TestThreadContext:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("reply", ["yes", "Yes", " ok ", "approve", "no", "/approve", "/deny always", "👍"])
