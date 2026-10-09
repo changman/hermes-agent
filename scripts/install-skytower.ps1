@@ -119,8 +119,53 @@ function Find-Python {
     $py = Get-Command python -ErrorAction SilentlyContinue
     if ($py) { return $py.Source }
 
-    Write-Err "Python을 찾을 수 없습니다. Hermes가 올바르게 설치됐는지 확인하세요."
-    exit 1
+    # PM 관리 Hermes 는 설치 폴더 venv 가 없고 시스템 Python 도 없을 수 있다 — 그때는 필요 없다.
+    return $null
+}
+
+# PM(패키지 관리자) 을 쓰는 Hermes 인가: 설치 폴더 venv 가 없고 installs\ 아래 기록이 있다.
+function Test-PmManaged {
+    param([string]$InstallDir, [string]$HermesHomeDir)
+    return (-not (Test-Path "$InstallDir\venv")) -and [bool](Get-ChildItem "$HermesHomeDir\installs\*\facts.json" -ErrorAction SilentlyContinue)
+}
+
+# Hermes 가 실제로 도는 파이썬.
+# PM 을 쓰는 Hermes 는 설치 폴더의 venv 를 지우고 <HermesHome>\installs\<key>\environments\<hash>\venv
+# 에서 돈다. key 는 설치 폴더 실경로의 sha256 앞 16자 (pm/environments.py install_key).
+function Find-RuntimePython {
+    param([string]$InstallDir, [string]$HermesHomeDir)
+
+    $venvPython = "$InstallDir\venv\Scripts\python.exe"
+    if (Test-Path $venvPython) { return $venvPython }
+
+    $facts = @()
+    try {
+        $full = (Get-Item $InstallDir).FullName.TrimEnd('\')
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $hash = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($full)) | ForEach-Object { $_.ToString("x2") })
+        $facts += "$HermesHomeDir\installs\$($hash.Substring(0, 16))\facts.json"
+    } catch {}
+    $facts += @(Get-ChildItem "$HermesHomeDir\installs\*\facts.json" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+
+    foreach ($f in $facts) {
+        if (-not (Test-Path $f)) { continue }
+        try {
+            $envDir = (Get-Content $f -Raw | ConvertFrom-Json).packages.venv.environment
+        } catch { continue }
+        if ($envDir -and (Test-Path "$envDir\Scripts\python.exe")) { return "$envDir\Scripts\python.exe" }
+    }
+    return $null
+}
+
+function Find-HermesCli {
+    param([string]$InstallDir, [string]$HermesHomeDir)
+
+    $cmd = Get-Command hermes -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    foreach ($p in @("$HermesHomeDir\bin\hermes.exe", "$HermesHomeDir\bin\hermes.cmd", "$InstallDir\venv\Scripts\hermes.exe")) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
 }
 
 function Find-Uv {
@@ -192,10 +237,21 @@ function Install-PluginFiles {
 # ============================================================================
 
 function Install-Deps {
-    param([string]$InstallDir, [string]$PythonExe, [string]$UvExe)
+    param([string]$InstallDir, [string]$HermesHomeDir, [string]$PythonExe, [string]$UvExe)
+
+    # PM 이 관리하는 환경에 손으로 깔면 다음 hermes update 때 사라진다.
+    # 거기서는 plugin.yaml 의 python_dependencies 를 Enable-Plugin 이 PM 으로 설치한다.
+    if (Test-PmManaged -InstallDir $InstallDir -HermesHomeDir $HermesHomeDir) {
+        Write-Info "PM 관리 환경 — 의존성은 플러그인 활성화 때 Hermes 가 설치합니다"
+        return
+    }
+    if (-not $PythonExe -and -not $UvExe) {
+        Write-Err "Python을 찾을 수 없습니다. Hermes가 올바르게 설치됐는지 확인하세요."
+        exit 1
+    }
 
     Write-Info "Skytower 의존성 설치 중 (python-socketio, psutil)..."
-    $pkgs = @("python-socketio[asyncio_client]>=5.11", "psutil>=5.9")
+    $pkgs = @("python-socketio[asyncio_client]>=5.11,<6", "psutil>=5.9")
 
     if ($UvExe) {
         $env:VIRTUAL_ENV = "$InstallDir\venv"
@@ -214,6 +270,31 @@ function Install-Deps {
         exit 1
     }
     Write-Success "의존성 설치 완료"
+}
+
+# ============================================================================
+# 플러그인 활성화 (plugins.enabled)
+# ============================================================================
+
+# PM 은 plugins.enabled 에 있는 플러그인의 python_dependencies 만 환경에 넣는다.
+# 활성화하지 않으면 hermes update 가 환경을 다시 만들 때 python-socketio 가 빠진다.
+# 구버전 Hermes 에서는 config.yaml 에 기록만 한다 (번들 플랫폼은 원래 자동 로드).
+function Enable-Plugin {
+    param([string]$HermesCli, [string]$HermesHomeDir)
+
+    if (-not $HermesCli) {
+        Write-Warn "hermes 명령을 찾지 못해 플러그인 활성화를 건너뜁니다"
+        Write-Warn "  직접 실행하세요: hermes plugins enable skytower-platform"
+        return
+    }
+    Write-Info "플러그인 활성화 중 (hermes plugins enable skytower-platform)..."
+    $env:HERMES_HOME = $HermesHomeDir
+    & $HermesCli plugins enable skytower-platform
+    if ($LASTEXITCODE -eq 0) {
+        Write-Success "플러그인 활성화 완료"
+    } else {
+        Write-Warn "플러그인 활성화 실패 — 직접 실행하세요: hermes plugins enable skytower-platform"
+    }
 }
 
 # ============================================================================
@@ -274,26 +355,52 @@ function Configure-Env {
 # 동작 확인
 # ============================================================================
 
-function Test-Plugin {
-    param([string]$InstallDir, [string]$PythonExe)
+# Hermes 가 실제로 도는 파이썬에서 확인한다. adapter 는 socketio 를 함수 안에서
+# import 하므로 register import 만으로는 의존성 누락을 잡지 못한다 — 따로 본다.
+function Test-RuntimeImport {
+    param([string]$InstallDir, [string]$RuntimePython)
 
-    Write-Info "플러그인 로드 확인 중..."
-    $result = & $PythonExe -c @"
+    $code = @"
 import sys
 sys.path.insert(0, r'$InstallDir')
 try:
+    import socketio
     from plugins.platforms.skytower import register
     print('OK')
 except Exception as e:
     print('FAIL:', e)
-"@ 2>&1
+"@
+    $result = & $RuntimePython -c $code 2>$null
+    return [bool]($result -match "^OK")
+}
 
-    if ($result -match "^OK") {
-        Write-Success "플러그인 로드 확인 완료"
-    } else {
-        Write-Warn "플러그인 로드 확인 실패 — 설치는 완료됐지만 import 테스트에 실패했습니다"
-        Write-Warn "의존성(python-socketio)이 설치됐는지 확인하세요"
+function Test-Plugin {
+    param([string]$InstallDir, [string]$HermesHomeDir, [string]$HermesCli)
+
+    Write-Info "플러그인 로드 확인 중..."
+    $runtimePython = Find-RuntimePython -InstallDir $InstallDir -HermesHomeDir $HermesHomeDir
+    if (-not $runtimePython) {
+        Write-Warn "Hermes 실행 환경을 찾지 못해 확인을 건너뜁니다"
+        return
     }
+    if (Test-RuntimeImport -InstallDir $InstallDir -RuntimePython $runtimePython) {
+        Write-Success "플러그인 로드 확인 완료 ($runtimePython)"
+        return
+    }
+    # 이미 활성화돼 있으면 enable 이 아무것도 하지 않는다 — PM 동기화로 의존성을 채운다.
+    if ((Test-PmManaged -InstallDir $InstallDir -HermesHomeDir $HermesHomeDir) -and $HermesCli) {
+        Write-Info "python-socketio 가 없습니다 — Hermes 환경 동기화 중 (hermes pm install)..."
+        $env:HERMES_HOME = $HermesHomeDir
+        & $HermesCli pm install
+        $pmOk = ($LASTEXITCODE -eq 0)
+        $runtimePython = Find-RuntimePython -InstallDir $InstallDir -HermesHomeDir $HermesHomeDir
+        if ($pmOk -and $runtimePython -and (Test-RuntimeImport -InstallDir $InstallDir -RuntimePython $runtimePython)) {
+            Write-Success "플러그인 로드 확인 완료 ($runtimePython)"
+            return
+        }
+    }
+    Write-Warn "플러그인 로드 확인 실패 — python-socketio 가 Hermes 환경($runtimePython)에 없습니다"
+    Write-Warn "  hermes plugins enable skytower-platform 후 hermes update 를 실행하세요"
 }
 
 # ============================================================================
@@ -343,12 +450,14 @@ $InstallDir   = Find-HermesInstall
 $HermesHomeResolved = Resolve-HermesHome -InstallDir $InstallDir
 $PythonExe    = Find-Python   -InstallDir $InstallDir
 $UvExe        = Find-Uv       -InstallDir $InstallDir
+$HermesCli    = Find-HermesCli -InstallDir $InstallDir -HermesHomeDir $HermesHomeResolved
 $ScriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $ScriptDir) { $ScriptDir = $PWD.Path }
 
 Install-PluginFiles -InstallDir $InstallDir -ScriptDir $ScriptDir
-Install-Deps        -InstallDir $InstallDir -PythonExe $PythonExe -UvExe $UvExe
+Install-Deps        -InstallDir $InstallDir -HermesHomeDir $HermesHomeResolved -PythonExe $PythonExe -UvExe $UvExe
+Enable-Plugin       -HermesCli $HermesCli -HermesHomeDir $HermesHomeResolved
 Configure-Env       -HermesHomeDir $HermesHomeResolved
-Test-Plugin         -InstallDir $InstallDir -PythonExe $PythonExe
+Test-Plugin         -InstallDir $InstallDir -HermesHomeDir $HermesHomeResolved -HermesCli $HermesCli
 
 Write-SuccessBanner -InstallDir $InstallDir -HermesHomeDir $HermesHomeResolved

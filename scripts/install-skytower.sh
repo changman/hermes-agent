@@ -149,6 +149,40 @@ find_python() {
     for loc in "$(command -v uv 2>/dev/null)" "$HOME/.local/bin/uv" "$HOME/.cargo/bin/uv"; do
         [ -x "$loc" ] && UV_CMD="$loc" && break
     done
+
+    # hermes CLI 탐색 (curl | bash 는 로그인 셸이 아니라 PATH 에 없을 수 있다)
+    HERMES_CLI=""
+    for loc in "$(command -v hermes 2>/dev/null)" "$HOME/.local/bin/hermes" "$HERMES_INSTALL_DIR/venv/bin/hermes"; do
+        [ -n "$loc" ] && [ -x "$loc" ] && HERMES_CLI="$loc" && break
+    done
+}
+
+# Hermes 가 실제로 도는 파이썬.
+# PM(패키지 관리자) 을 쓰는 Hermes 는 설치 폴더의 venv 를 지우고
+# $HERMES_HOME/installs/<key>/environments/<hash>/venv 에서 돈다. key 는 설치 폴더
+# 실경로의 sha256 앞 16자 (pm/environments.py install_key), 선택된 환경은 그 facts.json 에 있다.
+find_runtime_python() {
+    RUNTIME_PYTHON=""
+    if [ -x "$HERMES_INSTALL_DIR/venv/bin/python" ]; then
+        RUNTIME_PYTHON="$HERMES_INSTALL_DIR/venv/bin/python"
+        return 0
+    fi
+    local key facts env
+    key="$("$HERMES_PYTHON" -c 'import hashlib, pathlib, sys; print(hashlib.sha256(str(pathlib.Path(sys.argv[1]).resolve()).encode()).hexdigest()[:16])' "$HERMES_INSTALL_DIR" 2>/dev/null || true)"
+    for facts in ${key:+"$HERMES_HOME/installs/$key/facts.json"} "$HERMES_HOME"/installs/*/facts.json; do
+        [ -f "$facts" ] || continue
+        env="$(grep -o '"environment": *"[^"]*"' "$facts" | sed 's/.*"\([^"]*\)"$/\1/' | grep '/environments/' | head -1)"
+        if [ -n "$env" ] && [ -x "$env/bin/python" ]; then
+            RUNTIME_PYTHON="$env/bin/python"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# PM 을 쓰는 Hermes 인가: 설치 폴더 venv 가 없고 installs/ 아래 기록이 있다.
+is_pm_managed() {
+    [ ! -d "$HERMES_INSTALL_DIR/venv" ] && compgen -G "$HERMES_HOME/installs/*/facts.json" >/dev/null
 }
 
 # ============================================================================
@@ -201,20 +235,49 @@ install_plugin_files() {
 # ============================================================================
 
 install_deps() {
+    # PM 이 관리하는 환경에 손으로 깔면 다음 hermes update 때 사라진다.
+    # 거기서는 plugin.yaml 의 python_dependencies 를 enable_plugin 이 PM 으로 설치한다.
+    if is_pm_managed; then
+        log_info "PM 관리 환경 — 의존성은 플러그인 활성화 때 Hermes 가 설치합니다"
+        return 0
+    fi
+
     log_info "Skytower 의존성 설치 중 (python-socketio, psutil)..."
-    local pkgs="python-socketio[asyncio_client]>=5.11 psutil>=5.9"
+    local pkgs=("python-socketio[asyncio_client]>=5.11,<6" "psutil>=5.9")
 
     if [ -n "$UV_CMD" ] && [ -d "$HERMES_INSTALL_DIR/venv" ]; then
-        VIRTUAL_ENV="$HERMES_INSTALL_DIR/venv" $UV_CMD pip install $pkgs -q
+        VIRTUAL_ENV="$HERMES_INSTALL_DIR/venv" "$UV_CMD" pip install "${pkgs[@]}" -q
     elif [ -x "$HERMES_INSTALL_DIR/venv/bin/pip" ]; then
-        "$HERMES_INSTALL_DIR/venv/bin/pip" install $pkgs -q
+        "$HERMES_INSTALL_DIR/venv/bin/pip" install "${pkgs[@]}" -q
     elif [ -x "$HERMES_INSTALL_DIR/venv/bin/python" ]; then
-        "$HERMES_INSTALL_DIR/venv/bin/python" -m pip install $pkgs -q
+        "$HERMES_INSTALL_DIR/venv/bin/python" -m pip install "${pkgs[@]}" -q
     else
-        $HERMES_PYTHON -m pip install $pkgs -q
+        $HERMES_PYTHON -m pip install "${pkgs[@]}" -q
     fi
 
     log_success "의존성 설치 완료"
+}
+
+# ============================================================================
+# 플러그인 활성화 (plugins.enabled)
+# ============================================================================
+
+# PM 은 plugins.enabled 에 있는 플러그인의 python_dependencies 만 환경에 넣는다.
+# 활성화하지 않으면 hermes update 가 환경을 다시 만들 때 python-socketio 가 빠진다.
+# 구버전 Hermes 에서는 config.yaml 에 기록만 한다 (번들 플랫폼은 원래 자동 로드).
+# stdin 을 /dev/null 로: curl | bash 에서 자식이 스크립트 본문을 읽어 가지 않게.
+enable_plugin() {
+    if [ -z "$HERMES_CLI" ]; then
+        log_warn "hermes 명령을 찾지 못해 플러그인 활성화를 건너뜁니다"
+        log_warn "  직접 실행하세요: hermes plugins enable skytower-platform"
+        return 0
+    fi
+    log_info "플러그인 활성화 중 (hermes plugins enable skytower-platform)..."
+    if HERMES_HOME="$HERMES_HOME" "$HERMES_CLI" plugins enable skytower-platform </dev/null; then
+        log_success "플러그인 활성화 완료"
+    else
+        log_warn "플러그인 활성화 실패 — 직접 실행하세요: hermes plugins enable skytower-platform"
+    fi
 }
 
 # ============================================================================
@@ -272,50 +335,44 @@ configure_env() {
         log_warn "  SKYTOWER_TOKEN=agentId:rawToken"
         log_warn "  SKYTOWER_URL=https://relay.example.com"
     fi
-
-    log_success "의존성 설치 완료"
 }
 
 # ============================================================================
 # 동작 확인
 # ============================================================================
 
-verify_plugin() {
-    log_info "플러그인 로드 확인 중..."
-    if "$HERMES_PYTHON" -c "
+# Hermes 가 실제로 도는 파이썬에서 확인한다. adapter 는 socketio 를 함수 안에서
+# import 하므로 register import 만으로는 의존성 누락을 잡지 못한다 — 따로 본다.
+_runtime_check() {
+    "$RUNTIME_PYTHON" -c "
 import sys
 sys.path.insert(0, '$HERMES_INSTALL_DIR')
+import socketio
 from plugins.platforms.skytower import register
 print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        log_success "플러그인 로드 확인 완료"
-    else
-        log_warn "플러그인 로드 확인 실패 — 설치는 완료됐지만 import 테스트에 실패했습니다"
-        log_warn "의존성(python-socketio)이 설치됐는지 확인하세요"
-    fi
+" 2>/dev/null | grep -q "OK"
 }
 
-# ============================================================================
-# 완료 메시지
-# ============================================================================
-
-# ============================================================================
-# 동작 확인
-# ============================================================================
-
 verify_plugin() {
     log_info "플러그인 로드 확인 중..."
-    if "$HERMES_PYTHON" -c "
-import sys
-sys.path.insert(0, '$HERMES_INSTALL_DIR')
-from plugins.platforms.skytower import register
-print('OK')
-" 2>/dev/null | grep -q "OK"; then
-        log_success "플러그인 로드 확인 완료"
-    else
-        log_warn "플러그인 로드 확인 실패 — 설치는 완료됐지만 import 테스트에 실패했습니다"
-        log_warn "의존성(python-socketio)이 설치됐는지 확인하세요"
+    if ! find_runtime_python; then
+        log_warn "Hermes 실행 환경을 찾지 못해 확인을 건너뜁니다"
+        return 0
     fi
+    if _runtime_check; then
+        log_success "플러그인 로드 확인 완료 ($RUNTIME_PYTHON)"
+        return 0
+    fi
+    # 이미 활성화돼 있으면 enable 이 아무것도 하지 않는다 — PM 동기화로 의존성을 채운다.
+    if is_pm_managed && [ -n "$HERMES_CLI" ]; then
+        log_info "python-socketio 가 없습니다 — Hermes 환경 동기화 중 (hermes pm install)..."
+        if HERMES_HOME="$HERMES_HOME" "$HERMES_CLI" pm install </dev/null && find_runtime_python && _runtime_check; then
+            log_success "플러그인 로드 확인 완료 ($RUNTIME_PYTHON)"
+            return 0
+        fi
+    fi
+    log_warn "플러그인 로드 확인 실패 — python-socketio 가 Hermes 환경($RUNTIME_PYTHON)에 없습니다"
+    log_warn "  hermes plugins enable skytower-platform 후 hermes update 를 실행하세요"
 }
 
 # ============================================================================
@@ -365,6 +422,7 @@ main() {
     find_python
     install_plugin_files
     install_deps
+    enable_plugin
     configure_env
     verify_plugin
     print_success
