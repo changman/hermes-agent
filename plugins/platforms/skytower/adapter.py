@@ -1057,7 +1057,7 @@ def register(ctx) -> None:
         apply_yaml_config_fn=_apply_yaml_config,
         required_env=["SKYTOWER_TOKEN", "SKYTOWER_URL"],
         install_hint="run `hermes plugins enable skytower-platform` to install python-socketio "
-                     "(older Hermes: pip install 'python-socketio[asyncio_client]>=5,<6')",
+                     "(older Hermes: pip install 'python-socketio[asyncio_client]>=5.11,<6')",
         allowed_users_env="SKYTOWER_ALLOWED_USERS",
         allow_all_env="SKYTOWER_ALLOW_ALL_USERS",
         emoji="🗼",

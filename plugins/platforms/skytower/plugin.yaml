@@ -13,7 +13,7 @@ author: changman
 # check_fn 이 False 가 되어 플랫폼이 등록되지 않는다 ('skytower' is not a valid Platform).
 # psutil 은 코어 의존성이라 적지 않는다.
 python_dependencies:
-  - "python-socketio[asyncio_client]>=5,<6"
+  - "python-socketio[asyncio_client]>=5.11,<6"
 requires_env:
   - name: SKYTOWER_TOKEN
     description: "Skytower agent token (agentId:rawToken format)"
