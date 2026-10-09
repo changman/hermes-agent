@@ -309,6 +309,27 @@ class TestGetChatInfo:
 
 
 # ---------------------------------------------------------------------------
+# Manifest: python_dependencies
+# ---------------------------------------------------------------------------
+
+class TestManifestDependencies:
+    def test_declares_socketio_with_asyncio_client(self):
+        """hermes update 가 환경을 다시 만들 때 socketio 가 빠지지 않게 manifest 에 선언돼 있어야 한다."""
+        from pathlib import Path
+        from packaging.requirements import Requirement
+        from hermes_cli.plugins_manifest import parse_manifest_file
+        import plugins.platforms.skytower as pkg
+
+        plugin_dir = Path(pkg.__file__).parent
+        manifest = parse_manifest_file(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "platforms")
+        reqs = {Requirement(s).name: Requirement(s) for s in manifest.python_dependencies}
+        socketio = reqs["python-socketio"]
+        assert "asyncio_client" in socketio.extras  # AsyncClient 는 aiohttp 가 필요하다
+        assert not socketio.specifier.contains("6.0")  # 메이저 업그레이드는 막는다
+        assert socketio.specifier.contains("5.16.2")
+
+
+# ---------------------------------------------------------------------------
 # YAML config bridging (channel_skill_bindings / default_skill / channel_names)
 # ---------------------------------------------------------------------------
 
