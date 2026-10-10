@@ -804,3 +804,129 @@ class TestThreadContext:
         })
         event = adapter.handle_message.call_args[0][0]
         assert event.text == "본문 메시지"
+
+
+# ---------------------------------------------------------------------------
+# 모델 조회 · 명령 목록 (웹 헤더의 모델 버튼, 슬래시 메뉴)
+# ---------------------------------------------------------------------------
+
+class _FakeRunner:
+    """게이트웨이 러너 대역: 세션 키는 실제 규칙(build_session_key), /model 오버라이드는 dict."""
+
+    def __init__(self):
+        self._session_model_overrides = {}
+
+    def _session_key_for_source(self, source):
+        from gateway.session import build_session_key
+        return build_session_key(source, group_sessions_per_user=True)
+
+
+class TestModelInfo:
+    _DEFAULT = {"model": "upstage/solar-pro4", "provider": "nous"}
+
+    async def _session_key_of(self, adapter, payload):
+        """메시지를 처리할 때 게이트웨이가 볼 세션 키."""
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_relay_message(payload)
+        return adapter.gateway_runner._session_key_for_source(adapter.handle_message.call_args[0][0].source)
+
+    @pytest.mark.asyncio
+    async def test_default_model_when_no_session_override(self):
+        adapter = _make_adapter()
+        adapter.gateway_runner = _FakeRunner()
+        with patch("plugins.platforms.skytower.adapter._default_model", return_value=dict(self._DEFAULT)):
+            info = adapter._conversation_model({"user_id": 7, "conversation_id": 3})
+        assert info["scope"] == "default"
+        assert info["model"] == "upstage/solar-pro4"
+        assert info["default_model"] == "upstage/solar-pro4"
+
+    @pytest.mark.asyncio
+    async def test_session_override_of_private_room(self):
+        adapter = _make_adapter()
+        adapter.gateway_runner = _FakeRunner()
+        key = await self._session_key_of(adapter, {
+            "direction": "outbound", "type": "text", "content": "/model x", "user_id": 7, "conversation_id": 3, "id": 1,
+        })
+        adapter.gateway_runner._session_model_overrides[key] = {"model": "anthropic/claude-sonnet-5.5", "provider": "openrouter"}
+        with patch("plugins.platforms.skytower.adapter._default_model", return_value=dict(self._DEFAULT)):
+            info = adapter._conversation_model({"user_id": 7, "conversation_id": 3})
+            other = adapter._conversation_model({"user_id": 7, "conversation_id": 4})
+        assert info["scope"] == "session"
+        assert info["model"] == "anthropic/claude-sonnet-5.5"
+        assert info["provider"] == "openrouter"
+        assert info["default_model"] == "upstage/solar-pro4"
+        assert other["scope"] == "default", "다른 대화방은 오버라이드를 보지 않는다"
+
+    @pytest.mark.asyncio
+    async def test_shared_room_override_is_seen_by_every_member(self):
+        adapter = _make_adapter()
+        adapter.gateway_runner = _FakeRunner()
+        key = await self._session_key_of(adapter, {
+            "direction": "outbound", "type": "text", "content": "/model x", "user_id": 7, "user_name": "Alice",
+            "conversation_id": 40, "id": 1, "shared": True, "mentioned": True, "project": {"id": 12, "name": "Acme"},
+        })
+        adapter.gateway_runner._session_model_overrides[key] = {"model": "m/shared"}
+        with patch("plugins.platforms.skytower.adapter._default_model", return_value=dict(self._DEFAULT)):
+            info = adapter._conversation_model({"user_id": 8, "conversation_id": 40, "shared": True})
+        assert info["scope"] == "session"
+        assert info["model"] == "m/shared"
+        assert info["provider"] == "nous", "오버라이드에 provider 가 없으면 기본값"
+
+    @pytest.mark.asyncio
+    async def test_model_request_emits_response_with_request_id(self):
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+        with patch("plugins.platforms.skytower.adapter._default_model", return_value=dict(self._DEFAULT)):
+            await adapter._handle_agent_model_request({"requestId": "r1", "user_id": 7, "conversation_id": 3})
+        event, payload = adapter._sio.emit.call_args[0]
+        assert event == "agent:model-response"
+        assert payload["requestId"] == "r1"
+        assert payload["model"] == "upstage/solar-pro4"
+
+    def test_heartbeat_carries_default_model(self):
+        from plugins.platforms.skytower.adapter import SkyTowerAdapter
+        with patch("plugins.platforms.skytower.adapter._default_model", return_value=dict(self._DEFAULT)):
+            metrics = SkyTowerAdapter._collect_metrics()
+        assert metrics["model"] == "upstage/solar-pro4"
+        assert metrics["provider"] == "nous"
+        assert metrics["agent_type"] == "hermes"
+
+    def test_default_model_reads_config(self):
+        from plugins.platforms.skytower.adapter import _default_model
+        with patch("gateway.run._load_gateway_config", return_value={"model": {"default": "a/b", "provider": "p"}}):
+            assert _default_model() == {"model": "a/b", "provider": "p"}
+        with patch("gateway.run._load_gateway_config", return_value={"model": "a/c"}):
+            assert _default_model() == {"model": "a/c", "provider": None}
+        with patch("gateway.run._load_gateway_config", side_effect=RuntimeError("boom")):
+            assert _default_model() == {"model": None, "provider": None}
+
+
+class TestCommandList:
+    def test_gateway_commands_include_model_and_retry(self):
+        from plugins.platforms.skytower.adapter import _gateway_commands
+        groups = _gateway_commands()
+        flat = {c["command"]: c["description"] for cmds in groups.values() for c in cmds}
+        assert "/model" in flat and "/retry" in flat
+        assert "--global" in flat["/model"], "인자 힌트가 설명에 붙는다"
+        assert "/start" not in flat
+        assert all(c["command"].startswith("/") for cmds in groups.values() for c in cmds)
+
+    def test_gateway_commands_exclude_cli_only(self):
+        from hermes_cli.commands import COMMAND_REGISTRY
+        from plugins.platforms.skytower.adapter import _gateway_commands
+        flat = {c["command"] for cmds in _gateway_commands().values() for c in cmds}
+        cli_only = {f"/{c.name}" for c in COMMAND_REGISTRY if c.cli_only and not c.gateway_config_gate}
+        assert not (flat & cli_only)
+
+    @pytest.mark.asyncio
+    async def test_skills_response_carries_commands(self):
+        adapter = _make_adapter()
+        adapter._sio = AsyncMock()
+        adapter._sio.connected = True
+        with patch("agent.skill_commands.scan_skill_commands", return_value={}):
+            await adapter._handle_agent_skills_request({"requestId": "q"})
+        event, payload = adapter._sio.emit.call_args[0]
+        assert event == "agent:skills-response"
+        assert payload["requestId"] == "q"
+        assert any(c["command"] == "/model" for cmds in payload["commands"].values() for c in cmds)
