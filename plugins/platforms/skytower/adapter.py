@@ -131,6 +131,58 @@ def _with_thread_context(text: str, root: dict) -> str:
     )
 
 
+def _gateway_commands() -> Dict[str, List[Dict[str, str]]]:
+    """웹 슬래시 메뉴에 띄울 내장 명령. 카테고리 → [{command, description}].
+
+    relay 의 ``agent:skills-response`` 에 ``commands`` 로 싣는다. 이게 비어 있으면 웹 메뉴에는
+    스킬만 보이고 ``/model`` · ``/retry`` 같은 명령이 하나도 나오지 않는다.
+    게이트웨이에서 쓸 수 있는 것만, 별칭은 빼고, 설명에 인자 힌트를 붙인다.
+    """
+    try:
+        from hermes_cli import commands as _cmds
+    except Exception as exc:  # pragma: no cover - 배포 환경 차이
+        logger.warning("skytower: command registry unavailable: %s", exc)
+        return {}
+    try:
+        gates = _cmds._resolve_config_gates()
+    except Exception:
+        gates = set()
+    out: Dict[str, List[Dict[str, str]]] = {}
+    for cmd in _cmds.COMMAND_REGISTRY:
+        if cmd.name in _HIDDEN_COMMANDS:
+            continue
+        try:
+            if not _cmds._is_gateway_available(cmd, gates):
+                continue
+        except Exception:
+            if cmd.cli_only:
+                continue
+        desc = cmd.description
+        if cmd.args_hint:
+            desc = f"{desc} — /{cmd.name} {cmd.args_hint}"
+        out.setdefault(cmd.category, []).append({"command": f"/{cmd.name}", "description": desc})
+    return out
+
+
+# 메뉴에 띄워도 쓸모없는 명령: 플랫폼 시작 핑 응답, 텔레그램 전용 토픽.
+_HIDDEN_COMMANDS = frozenset({"start", "topic"})
+
+
+def _default_model() -> Dict[str, Optional[str]]:
+    """config.yaml 의 기본 모델. 대화별 /model 오버라이드가 없을 때 쓰인다."""
+    try:
+        from gateway.run import _load_gateway_config
+        cfg = _load_gateway_config() or {}
+    except Exception:
+        return {"model": None, "provider": None}
+    model_cfg = cfg.get("model")
+    if isinstance(model_cfg, dict):
+        return {"model": model_cfg.get("default") or None, "provider": model_cfg.get("provider") or None}
+    if isinstance(model_cfg, str):
+        return {"model": model_cfg or None, "provider": None}
+    return {"model": None, "provider": None}
+
+
 def _shared_chat_id(agent_id: str, conv_id: str) -> str:
     """공유 프로젝트 방의 chat_id. 사용자 id 를 넣지 않아 방 하나가 세션 하나가 된다.
 
@@ -439,6 +491,10 @@ class SkyTowerAdapter(BasePlatformAdapter):
         async def on_request_agent_skills(data: dict):
             await self._handle_agent_skills_request(data)
 
+        @self._sio.on("request:agent-model")
+        async def on_request_agent_model(data: dict):
+            await self._handle_agent_model_request(data)
+
         try:
             await self._sio.connect(
                 self._relay_url,
@@ -461,6 +517,46 @@ class SkyTowerAdapter(BasePlatformAdapter):
         if self._sio:
             await self._sio.disconnect()
         self._mark_disconnected()
+
+    # ── 대화방 → 세션 source ──────────────────────────────────────────────────
+
+    def _room_chat_id(self, user_str: str, conv_str: Optional[str], shared: bool) -> str:
+        if shared and conv_str:
+            return _shared_chat_id(self._agent_id, conv_str)
+        if conv_str:
+            return f"skytower:{self._agent_id}:{user_str}:{conv_str}"
+        return f"skytower:{self._agent_id}:{user_str}"
+
+    def _room_source(
+        self,
+        user_str: str,
+        conv_str: Optional[str],
+        user_name: str,
+        shared: bool,
+        *,
+        project: Optional[dict] = None,
+        chat_topic: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ):
+        """메시지 처리와 모델 조회가 같은 세션 키를 보도록 source 를 한 곳에서 만든다."""
+        shared = shared and bool(conv_str)
+        # 공유 방은 방 하나 = 세션 하나여야 동료의 말을 같이 읽는다. 게이트웨이는 세션 키를
+        # 만들 때 플랫폼 extra 가 아니라 전역 config.group_sessions_per_user(기본 True) 를
+        # 보므로 extra 로는 못 막는다. 대신 build_session_key 가 thread_id 가 있으면
+        # (thread_sessions_per_user 기본 False) 사용자 부분을 붙이지 않는 규칙을 쓴다:
+        # 방 단위 thread_id 를 주면 전역 설정과 무관하게 사용자별 분리가 꺼진다.
+        if shared and thread_id is None:
+            thread_id = f"conv{conv_str}"
+        room_name = (project.get("name") if isinstance(project, dict) else None) or user_name
+        return self.build_source(
+            chat_id=self._room_chat_id(user_str, conv_str, shared),
+            chat_name=room_name if shared else user_name,
+            chat_type="group" if shared else "dm",
+            user_id=user_str,
+            user_name=user_name,
+            chat_topic=chat_topic,
+            thread_id=thread_id,
+        )
 
     # ── Inbound routing ───────────────────────────────────────────────────────
 
@@ -521,12 +617,7 @@ class SkyTowerAdapter(BasePlatformAdapter):
         if shared and data.get("mentioned") is False:
             logger.debug("shared room message without mention dropped conv=%s", conv_str)
             return
-        if shared:
-            chat_id = _shared_chat_id(self._agent_id, conv_str)
-        elif conv_str:
-            chat_id = f"skytower:{self._agent_id}:{user_str}:{conv_str}"
-        else:
-            chat_id = f"skytower:{self._agent_id}:{user_str}"
+        chat_id = self._room_chat_id(user_str, conv_str, shared)
 
         # ── 채널별 스킬 바인딩 & 프롬프트 해석 ──────────────────────────────
         from gateway.platforms.base import resolve_channel_skills, resolve_channel_prompt
@@ -559,24 +650,11 @@ class SkyTowerAdapter(BasePlatformAdapter):
         # 스레드별 세션 분리는 설정으로 켠다. 켜면 스레드가 대화방 맥락을
         # 물려받지 않고 독립된 히스토리를 갖는다.
         thread_id = _thread_id(data) if extra.get("thread_sessions") else None
-        # 공유 방은 방 하나 = 세션 하나여야 동료의 말을 같이 읽는다. 게이트웨이는 세션 키를
-        # 만들 때 플랫폼 extra 가 아니라 전역 config.group_sessions_per_user(기본 True) 를
-        # 보므로 extra 로는 못 막는다. 대신 build_session_key 가 thread_id 가 있으면
-        # (thread_sessions_per_user 기본 False) 사용자 부분을 붙이지 않는 규칙을 쓴다:
-        # 방 단위 thread_id 를 주면 전역 설정과 무관하게 사용자별 분리가 꺼진다.
-        if shared and thread_id is None:
-            thread_id = f"conv{conv_str}"
 
         project = data.get("project") if shared else None
-        room_name = (project.get("name") if isinstance(project, dict) else None) or user_name
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_name=room_name if shared else user_name,
-            chat_type="group" if shared else "dm",
-            user_id=user_str,
-            user_name=user_name,
-            chat_topic=chat_topic,
-            thread_id=thread_id,
+        source = self._room_source(
+            user_str, conv_str, user_name, shared,
+            project=project, chat_topic=chat_topic, thread_id=thread_id,
         )
         reply_to_message_id, reply_to_text = _extract_reply_to(data)
 
@@ -776,12 +854,54 @@ class SkyTowerAdapter(BasePlatformAdapter):
         await self._sio.emit("agent:skills-response", {
             "requestId": request_id,
             "skills": skills,
+            "commands": _gateway_commands(),
             "metadata": {
                 "agentType": "hermes",
                 "agentName": "Hermes Agent",
                 "version": "1.0.0",
             },
         })
+
+    # ── request:agent-model ──────────────────────────────────────────────────
+
+    def _conversation_model(self, data: dict) -> Dict[str, Any]:
+        """대화방 하나가 지금 쓰는 모델. /model 은 세션(대화) 단위라 에이전트마다 하나가 아니다.
+
+        메시지를 처리할 때와 같은 source 로 세션 키를 만들어 게이트웨이의 세션 오버라이드를
+        찾고, 없으면 config 기본값이다.
+        """
+        default = _default_model()
+        result: Dict[str, Any] = {
+            "model": default["model"], "provider": default["provider"], "scope": "default",
+            "default_model": default["model"], "default_provider": default["provider"],
+        }
+        user_id = data.get("user_id")
+        conv_id = data.get("conversation_id")
+        runner = getattr(self, "gateway_runner", None)
+        if user_id in (None, "") or runner is None:
+            return result
+        conv_str = str(conv_id) if conv_id not in (None, "") else None
+        source = self._room_source(str(user_id), conv_str, "", bool(data.get("shared")))
+        try:
+            session_key = runner._session_key_for_source(source)
+            override = runner._session_model_overrides.get(session_key)
+        except Exception as exc:
+            logger.debug("skytower: session model lookup failed: %s", exc)
+            return result
+        if isinstance(override, dict) and override.get("model"):
+            result.update(model=override.get("model"), provider=override.get("provider") or result["provider"],
+                          scope="session")
+        return result
+
+    async def _handle_agent_model_request(self, data: dict) -> None:
+        if not self._sio or not self._sio.connected or not isinstance(data, dict):
+            return
+        try:
+            info = self._conversation_model(data)
+        except Exception as exc:
+            logger.warning("skytower: model request failed: %s", exc)
+            info = {"error": str(exc)}
+        await self._sio.emit("agent:model-response", {"requestId": data.get("requestId", ""), **info})
 
     # ── Outbound (표준) ───────────────────────────────────────────────────────
 
@@ -953,14 +1073,17 @@ class SkyTowerAdapter(BasePlatformAdapter):
     def _collect_metrics() -> dict:
         try:
             import psutil
-            return {
+            metrics = {
                 "cpu": psutil.cpu_percent(interval=None),
                 "mem": psutil.virtual_memory().percent,
                 "disk": psutil.disk_usage("/").percent,
                 "agent_type": "hermes",
             }
         except ImportError:
-            return {"cpu": 0.0, "mem": 0.0, "disk": 0.0, "agent_type": "hermes"}
+            metrics = {"cpu": 0.0, "mem": 0.0, "disk": 0.0, "agent_type": "hermes"}
+        # 기본 모델 (대화별 /model 은 request:agent-model 로 따로 묻는다). 웹 헤더의 모델 버튼이 쓴다.
+        metrics.update(_default_model())
+        return metrics
 
     # ── 온보딩 ────────────────────────────────────────────────────────────────
 
